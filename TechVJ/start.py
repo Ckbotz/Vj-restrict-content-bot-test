@@ -42,6 +42,7 @@ class batch_temp(object):
     IS_BATCH = {}
     CUSTOM_SLEEP = {}  # Store custom sleep values per user
     CANCEL_TASKS = {}  # Store cancellation flags for immediate stop
+    ACTIVE_SESSIONS = {}  # Store active user session clients
 
 
 def clean_filename(filename):
@@ -110,6 +111,58 @@ async def smart_sleep(user_id):
         if batch_temp.CANCEL_TASKS.get(user_id, False):
             break
         await asyncio.sleep(0.5)
+
+
+async def get_user_session(user_id):
+    """Get or create user session and ensure it's started"""
+    if LOGIN_SYSTEM:
+        user_data = await db.get_session(user_id)
+        if user_data is None:
+            return None, "**For Downloading Restricted Content You Have To /login First.**"
+        
+        # Check if session already exists and is active
+        if user_id in batch_temp.ACTIVE_SESSIONS:
+            try:
+                # Test if session is still alive
+                await batch_temp.ACTIVE_SESSIONS[user_id].get_me()
+                return batch_temp.ACTIVE_SESSIONS[user_id], None
+            except:
+                # Session dead, remove it
+                try:
+                    await batch_temp.ACTIVE_SESSIONS[user_id].stop()
+                except:
+                    pass
+                del batch_temp.ACTIVE_SESSIONS[user_id]
+        
+        # Create new session
+        try:
+            acc = Client(
+                f"session_{user_id}",
+                session_string=user_data,
+                api_hash=API_HASH,
+                api_id=API_ID,
+            )
+            await acc.start()
+            batch_temp.ACTIVE_SESSIONS[user_id] = acc
+            return acc, None
+        except Exception as e:
+            return None, "**Your Login Session Expired. So /logout First Then Login Again By - /login**"
+    else:
+        if TechVJUser is None:
+            return None, "**String Session is not Set**"
+        return TechVJUser, None
+
+
+async def stop_user_session(user_id):
+    """Stop and cleanup user session after task completion"""
+    if user_id in batch_temp.ACTIVE_SESSIONS:
+        try:
+            await batch_temp.ACTIVE_SESSIONS[user_id].stop()
+            print(f"✅ Session stopped for user {user_id}")
+        except Exception as e:
+            print(f"Error stopping session for user {user_id}: {e}")
+        finally:
+            del batch_temp.ACTIVE_SESSIONS[user_id]
 
 
 # download status with cancellation check
@@ -196,7 +249,9 @@ async def send_help(client: Client, message: Message):
                 f"Example: `/setsleep 3 5 7 10` (bot will randomly pick from these values)\n\n" \
                 f"Use `/getsleep` to see your current sleep settings.\n\n" \
                 f"**🛑 Cancel Command:**\n" \
-                f"Use `/cancel` to immediately stop any ongoing batch process including current download/upload."
+                f"Use `/cancel` to immediately stop any ongoing batch process including current download/upload.\n\n" \
+                f"**💤 Session Management:**\n" \
+                f"Your session automatically goes to sleep after task completion to save resources."
     await client.send_message(chat_id=message.chat.id, text=help_text)
 
 
@@ -268,9 +323,13 @@ async def send_cancel(client: Client, message: Message):
         text="**🛑 CANCELLING ALL PROCESSES IMMEDIATELY!**\n\n"
              "⚠️ Stopping current download/upload...\n"
              "⚠️ Cleaning up temporary files...\n"
+             "⚠️ Session will be put to sleep...\n"
              "⚠️ Process will stop within seconds.",
         reply_to_message_id=message.id
     )
+    
+    # Stop user session after cancellation
+    await stop_user_session(user_id)
 
 
 @Client.on_message(filters.text & filters.private)
@@ -344,109 +403,53 @@ async def save(client: Client, message: Message):
         total_items = toID - fromID + 1
         completed = 0
 
-        for msgid in range(fromID, toID + 1):
-            # IMMEDIATE CANCELLATION CHECK
-            if batch_temp.CANCEL_TASKS.get(user_id, False) or batch_temp.IS_BATCH.get(user_id, True):
-                await client.send_message(
-                    message.chat.id,
-                    f"**🛑 Batch Process Cancelled!**\n\n"
-                    f"✅ Completed: {completed}/{total_items} items\n"
-                    f"❌ Cancelled at: {msgid}/{toID}",
-                    reply_to_message_id=message.id
-                )
-                batch_temp.CANCEL_TASKS[user_id] = False
-                batch_temp.IS_BATCH[user_id] = True
-                return
+        # Get or create user session
+        acc, error_msg = await get_user_session(user_id)
+        if acc is None:
+            await message.reply(error_msg)
+            batch_temp.IS_BATCH[user_id] = True
+            batch_temp.CANCEL_TASKS[user_id] = False
+            return
 
-            if LOGIN_SYSTEM:
-                user_data = await db.get_session(user_id)
-                if user_data is None:
-                    await message.reply("**For Downloading Restricted Content You Have To /login First.**")
-                    batch_temp.IS_BATCH[user_id] = True
-                    batch_temp.CANCEL_TASKS[user_id] = False
-                    return
-
-                try:
-                    acc = Client(
-                        "saverestricted",
-                        session_string=user_data,
-                        api_hash=API_HASH,
-                        api_id=API_ID,
-                    )
-                    await acc.start()
-                except:
-                    batch_temp.IS_BATCH[user_id] = True
-                    batch_temp.CANCEL_TASKS[user_id] = False
-                    return await message.reply(
-                        "**Your Login Session Expired. So /logout First Then Login Again By - /login**"
-                    )
-
-            else:
-                if TechVJUser is None:
-                    batch_temp.IS_BATCH[user_id] = True
-                    batch_temp.CANCEL_TASKS[user_id] = False
+        try:
+            for msgid in range(fromID, toID + 1):
+                # IMMEDIATE CANCELLATION CHECK
+                if batch_temp.CANCEL_TASKS.get(user_id, False) or batch_temp.IS_BATCH.get(user_id, True):
                     await client.send_message(
                         message.chat.id,
-                        "**String Session is not Set**",
-                        reply_to_message_id=message.id,
+                        f"**🛑 Batch Process Cancelled!**\n\n"
+                        f"✅ Completed: {completed}/{total_items} items\n"
+                        f"❌ Cancelled at: {msgid}/{toID}\n"
+                        f"💤 Session going to sleep...",
+                        reply_to_message_id=message.id
                     )
-                    return
+                    break
 
-                acc = TechVJUser
-
-            # CANCELLATION CHECK BEFORE PROCESSING
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
-                await client.send_message(
-                    message.chat.id,
-                    f"**🛑 Batch Process Cancelled!**\n\n"
-                    f"✅ Completed: {completed}/{total_items} items",
-                    reply_to_message_id=message.id
-                )
-                batch_temp.CANCEL_TASKS[user_id] = False
-                batch_temp.IS_BATCH[user_id] = True
-                return
-
-            # private
-            if "https://t.me/c/" in message.text:
-                chatid = int("-100" + datas[4])
-                try:
-                    success = await handle_private(client, acc, message, chatid, msgid)
-                    if success:
-                        completed += 1
-                except Exception as e:
-                    if ERROR_MESSAGE:
-                        await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-
-            # bot
-            elif "https://t.me/b/" in message.text:
-                username = datas[4]
-                try:
-                    success = await handle_private(client, acc, message, username, msgid)
-                    if success:
-                        completed += 1
-                except Exception as e:
-                    if ERROR_MESSAGE:
-                        await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-
-            # public
-            else:
-                username = datas[3]
-                try:
-                    msg = await client.get_messages(username, msgid)
-                except UsernameNotOccupied:
+                # CANCELLATION CHECK BEFORE PROCESSING
+                if batch_temp.CANCEL_TASKS.get(user_id, False):
                     await client.send_message(
                         message.chat.id,
-                        "The username is not occupied by anyone",
-                        reply_to_message_id=message.id,
+                        f"**🛑 Batch Process Cancelled!**\n\n"
+                        f"✅ Completed: {completed}/{total_items} items\n"
+                        f"💤 Session going to sleep...",
+                        reply_to_message_id=message.id
                     )
-                    batch_temp.IS_BATCH[user_id] = True
-                    batch_temp.CANCEL_TASKS[user_id] = False
-                    return
+                    break
 
-                try:
-                    await client.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
-                    completed += 1
-                except:
+                # private
+                if "https://t.me/c/" in message.text:
+                    chatid = int("-100" + datas[4])
+                    try:
+                        success = await handle_private(client, acc, message, chatid, msgid)
+                        if success:
+                            completed += 1
+                    except Exception as e:
+                        if ERROR_MESSAGE:
+                            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+
+                # bot
+                elif "https://t.me/b/" in message.text:
+                    username = datas[4]
                     try:
                         success = await handle_private(client, acc, message, username, msgid)
                         if success:
@@ -455,44 +458,74 @@ async def save(client: Client, message: Message):
                         if ERROR_MESSAGE:
                             await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
-            # CANCELLATION CHECK AFTER PROCESSING
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
-                await client.send_message(
-                    message.chat.id,
-                    f"**🛑 Batch Process Cancelled!**\n\n"
-                    f"✅ Completed: {completed}/{total_items} items",
-                    reply_to_message_id=message.id
-                )
-                batch_temp.CANCEL_TASKS[user_id] = False
-                batch_temp.IS_BATCH[user_id] = True
-                return
+                # public
+                else:
+                    username = datas[3]
+                    try:
+                        msg = await client.get_messages(username, msgid)
+                    except UsernameNotOccupied:
+                        await client.send_message(
+                            message.chat.id,
+                            "The username is not occupied by anyone",
+                            reply_to_message_id=message.id,
+                        )
+                        break
 
-            # Apply smart sleep BEFORE starting next download
-            if msgid < toID:
-                await smart_sleep(user_id)
-                
-            # Optional: Show progress every 5 items
-            if completed % 5 == 0 and completed < total_items:
-                try:
+                    try:
+                        await client.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+                        completed += 1
+                    except:
+                        try:
+                            success = await handle_private(client, acc, message, username, msgid)
+                            if success:
+                                completed += 1
+                        except Exception as e:
+                            if ERROR_MESSAGE:
+                                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+
+                # CANCELLATION CHECK AFTER PROCESSING
+                if batch_temp.CANCEL_TASKS.get(user_id, False):
                     await client.send_message(
                         message.chat.id,
-                        f"📊 Progress: {completed}/{total_items} completed...",
+                        f"**🛑 Batch Process Cancelled!**\n\n"
+                        f"✅ Completed: {completed}/{total_items} items\n"
+                        f"💤 Session going to sleep...",
                         reply_to_message_id=message.id
                     )
-                except:
-                    pass
+                    break
 
-        # Cleanup flags
-        batch_temp.IS_BATCH[user_id] = True
-        batch_temp.CANCEL_TASKS[user_id] = False
-        
-        # Send completion message
-        if completed > 0:
-            await client.send_message(
-                message.chat.id,
-                f"✅ **Batch Complete!**\n\nProcessed: {completed}/{total_items} items",
-                reply_to_message_id=message.id
-            )
+                # Apply smart sleep BEFORE starting next download
+                if msgid < toID:
+                    await smart_sleep(user_id)
+                    
+                # Optional: Show progress every 5 items
+                if completed % 5 == 0 and completed < total_items:
+                    try:
+                        await client.send_message(
+                            message.chat.id,
+                            f"📊 Progress: {completed}/{total_items} completed...",
+                            reply_to_message_id=message.id
+                        )
+                    except:
+                        pass
+
+        finally:
+            # ALWAYS cleanup and put session to sleep after task completion
+            batch_temp.IS_BATCH[user_id] = True
+            batch_temp.CANCEL_TASKS[user_id] = False
+            
+            # Stop user session to put it to sleep
+            await stop_user_session(user_id)
+            
+            # Send completion message
+            if completed > 0:
+                await client.send_message(
+                    message.chat.id,
+                    f"✅ **Batch Complete!**\n\n"
+                    f"Processed: {completed}/{total_items} items\n"
+                    f"💤 Session put to sleep - will wake up on next task",
+                    reply_to_message_id=message.id
+                )
 
 
 # handle private with immediate cancellation support - returns True if successful
