@@ -52,12 +52,18 @@ async def run_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
 
-    # PORT FIX (Use Koyeb assigned port)
-    port = int(os.environ.get("PORT", 8080))
+    # SAFE PORT FIX
+    try:
+        port = int(os.environ.get("PORT", 0))  # Koyeb assigned port
+        if port == 8080:
+            port = 8081  # change port automatically if conflict
 
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"Web server running on port {port} 🌐")
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"Web server running on port {port} 🌐")
+
+    except OSError:
+        print("⚠ Port already in use. Skipping extra web server.")
 # --------------------------------------
 
 
