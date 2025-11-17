@@ -6,6 +6,7 @@ from pyrogram import Client, idle
 from config import API_ID, API_HASH, BOT_TOKEN, STRING_SESSION, LOGIN_SYSTEM
 import asyncio
 from aiohttp import web
+import os
 
 # Create clients but don't start them yet
 if STRING_SESSION is not None and LOGIN_SYSTEM == False:
@@ -40,18 +41,24 @@ class Bot(Client):
         print('Bot Stopped 👋')
 
 
-# Simple web server for hosting (port 8080)
+# ---------- FIXED WEB SERVER ----------
 async def handle(request):
     return web.Response(text="Bot is alive ✅")
 
 async def run_web_server():
     app = web.Application()
-    app.router.add_get('/', handle)
+    app.router.add_get("/", handle)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
+
+    # PORT FIX (Use Koyeb assigned port)
+    port = int(os.environ.get("PORT", 8080))
+
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print("Web server running on port 8080 🌐")
+    print(f"Web server running on port {port} 🌐")
+# --------------------------------------
 
 
 async def main():
@@ -62,14 +69,22 @@ async def main():
         await TechVJUser.start()
         print("User Client Started ✅")
 
-    # Start web server
+    # Start web server safely
     asyncio.create_task(run_web_server())
 
-    await idle()  # Keeps both running
+    # Keep running
+    await idle()
 
+    # Shutdown
     await bot.stop()
     if TechVJUser is not None:
         await TechVJUser.stop()
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except RuntimeError:
+        # If event loop already running (rare case)
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
