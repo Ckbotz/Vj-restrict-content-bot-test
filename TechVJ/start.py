@@ -7,6 +7,9 @@ import asyncio
 import random
 import pyrogram
 import re
+import subprocess
+import time
+import aiohttp
 from pyrogram import Client, filters, enums
 from pyrogram.errors import (
     FloodWait,
@@ -30,11 +33,26 @@ WORDS_TO_REMOVE = [
     "[MABLG]",
     "@DA_RIPS",
     "@Da_Rips",
+    "DA_Rips",
+    "ADL_DRAMA",
+    "ADL",
+    "MABLG",
     # Add more words here
 ]
 
 # Permanent thumbnail URL (leave empty string "" to disable)
 PERMANENT_THUMBNAIL_URL = "https://envs.sh/lga.jpg"
+
+# Prefix and Suffix settings
+FILE_PREFIX = os.environ.get("FILE_PREFIX", "").strip() or None
+FILE_SUFFIX = os.environ.get("FILE_SUFFIX", "@DramaShip").strip() or None
+
+# Metadata settings
+METADATA_TITLE = os.environ.get("METADATA_TITLE", "{file_name}").strip() or None
+METADATA_AUTHOR = os.environ.get("METADATA_AUTHOR", "").strip() or None
+METADATA_ARTIST = os.environ.get("METADATA_ARTIST", "").strip() or None
+METADATA_DESCRIPTION = os.environ.get("METADATA_DESCRIPTION", "uploaded by @Dramaship").strip() or None
+METADATA_COMMENT = os.environ.get("METADATA_COMMENT", "").strip() or None
 # =========================================
 
 
@@ -67,6 +85,61 @@ def clean_filename(filename):
     return f"{name}.{ext}" if ext else name
 
 
+def apply_prefix_suffix(filename):
+    """Apply prefix and suffix to filename"""
+    if not filename:
+        return filename
+    
+    # Split filename and extension
+    name_parts = filename.rsplit('.', 1)
+    if len(name_parts) == 2:
+        name, ext = name_parts
+    else:
+        name = filename
+        ext = ""
+    
+    # Apply prefix
+    if FILE_PREFIX:
+        name = f"{FILE_PREFIX}.{name}"
+    
+    # Apply suffix
+    if FILE_SUFFIX:
+        name = f"{name}.{FILE_SUFFIX}"
+    
+    # Reconstruct filename
+    if ext:
+        return f"{name}.{ext}"
+    return name
+
+
+def format_bytes(size):
+    """Convert bytes to human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
+
+
+def create_progress_bar(percentage):
+    """Create a progress bar with 13 blocks"""
+    filled = int(percentage / 100 * 13)
+    bar = "■" * filled + "□" * (13 - filled)
+    return f"[{bar}]"
+
+
+def format_time(seconds):
+    """Format seconds into readable time"""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds / 60)}m {int(seconds % 60)}s"
+    else:
+        hours = int(seconds / 3600)
+        minutes = int((seconds % 3600) / 60)
+        return f"{hours}h {minutes}m"
+
+
 async def download_thumbnail(client, url):
     """Download thumbnail from URL"""
     if not url:
@@ -79,18 +152,84 @@ async def download_thumbnail(client, url):
         # Generate unique filename
         thumb_path = f"temp_thumbs/thumb_{random.randint(1000, 9999)}.jpg"
         
-        # Download using web_fetch or similar method
-        # Note: You might need to use requests library or another method
-        import requests
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            with open(thumb_path, 'wb') as f:
-                f.write(response.content)
-            return thumb_path
+        # Download using aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    with open(thumb_path, 'wb') as f:
+                        f.write(await response.read())
+                    return thumb_path
     except Exception as e:
         print(f"Error downloading thumbnail: {e}")
     
     return None
+
+
+async def add_metadata_with_ffmpeg(input_file, output_file, final_filename):
+    """Add metadata to video/audio files using ffmpeg while preserving all streams"""
+    
+    # Check if any metadata is set
+    if not any([METADATA_TITLE, METADATA_AUTHOR, METADATA_ARTIST, METADATA_DESCRIPTION, METADATA_COMMENT]):
+        return input_file, True
+    
+    # Check if file is video or audio
+    ext = input_file.rsplit('.', 1)[-1].lower()
+    if ext not in ['mp4', 'mkv', 'avi', 'mov', 'flv', 'wmv', 'webm', 'mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg']:
+        return input_file, True
+    
+    # Check if ffmpeg and ffprobe are available
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        subprocess.run(['ffprobe', '-version'], capture_output=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("FFmpeg/FFprobe not found. Skipping metadata addition.")
+        return input_file, True
+    
+    try:
+        # Build ffmpeg command with -map 0 to copy ALL streams (video, audio, subtitles)
+        cmd = [
+            'ffmpeg', '-i', input_file,
+            '-map', '0',  # Copy ALL streams from input
+            '-c', 'copy'  # Copy without re-encoding
+        ]
+        
+        # Add metadata flags
+        if METADATA_TITLE:
+            title = METADATA_TITLE.format(file_name=final_filename)
+            cmd.extend(['-metadata', f'title={title}'])
+        if METADATA_AUTHOR:
+            author = METADATA_AUTHOR.format(file_name=final_filename)
+            cmd.extend(['-metadata', f'author={author}'])
+        if METADATA_ARTIST:
+            artist = METADATA_ARTIST.format(file_name=final_filename)
+            cmd.extend(['-metadata', f'artist={artist}'])
+        if METADATA_DESCRIPTION:
+            description = METADATA_DESCRIPTION.format(file_name=final_filename)
+            cmd.extend(['-metadata', f'description={description}'])
+        if METADATA_COMMENT:
+            comment = METADATA_COMMENT.format(file_name=final_filename)
+            cmd.extend(['-metadata', f'comment={comment}'])
+        
+        cmd.extend(['-y', output_file])
+        
+        # Run ffmpeg
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        
+        process.wait()
+        
+        if process.returncode == 0 and os.path.exists(output_file):
+            return output_file, True
+        else:
+            raise Exception("FFmpeg failed")
+            
+    except Exception as e:
+        print(f"Metadata error: {e}")
+        return input_file, False
 
 
 # Anti-detection sleep function with randomization
@@ -165,52 +304,40 @@ async def stop_user_session(user_id):
             del batch_temp.ACTIVE_SESSIONS[user_id]
 
 
-# download status with cancellation check
-async def downstatus(client, statusfile, message, chat, user_id):
-    while True:
-        if batch_temp.CANCEL_TASKS.get(user_id, False):
-            return
-        if os.path.exists(statusfile):
-            break
-        await asyncio.sleep(3)
-
-    while os.path.exists(statusfile):
-        if batch_temp.CANCEL_TASKS.get(user_id, False):
-            return
-        with open(statusfile, "r") as downread:
-            txt = downread.read()
-        try:
-            await client.edit_message_text(chat, message.id, f"**Downloaded:** **{txt}**")
-            await asyncio.sleep(10)
-        except:
-            await asyncio.sleep(5)
-
-
-# upload status with cancellation check
-async def upstatus(client, statusfile, message, chat, user_id):
-    while True:
-        if batch_temp.CANCEL_TASKS.get(user_id, False):
-            return
-        if os.path.exists(statusfile):
-            break
-        await asyncio.sleep(3)
-
-    while os.path.exists(statusfile):
-        if batch_temp.CANCEL_TASKS.get(user_id, False):
-            return
-        with open(statusfile, "r") as upread:
-            txt = upread.read()
-        try:
-            await client.edit_message_text(chat, message.id, f"**Uploaded:** **{txt}**")
-            await asyncio.sleep(10)
-        except:
-            await asyncio.sleep(5)
-
-
-# progress writer
-def progress(current, total, message, type):
-    with open(f"{message.id}{type}status.txt", "w") as fileup:
-        fileup.write(f"{current * 100 / total:.1f}%")
+# Enhanced progress callback with progress bar
+async def progress_callback(current, total, message, mode, start_time):
+    """Progress callback for download/upload with visual progress bar"""
+    
+    # Check if user cancelled
+    user_id = message.from_user.id if hasattr(message, 'from_user') else None
+    if user_id and batch_temp.CANCEL_TASKS.get(user_id, False):
+        raise Exception("Process cancelled by user")
+    
+    now = time.time()
+    diff = now - start_time
+    
+    if diff < 1:  # Update every 1 second minimum
+        return
+    
+    percentage = current * 100 / total
+    speed = current / diff if diff > 0 else 0
+    eta = (total - current) / speed if speed > 0 else 0
+    
+    progress_bar = create_progress_bar(percentage)
+    
+    status_emoji = "📥" if mode == "download" else "📤"
+    status_text = "Downloading" if mode == "download" else "Uploading"
+    
+    try:
+        await message.edit_text(
+            f"**{status_emoji} {status_text}:** {percentage:.1f}%\n"
+            f"{progress_bar}\n"
+            f"**Speed:** {format_bytes(speed)}/s\n"
+            f"**ETA:** {format_time(eta)}\n"
+            f"**Size:** {format_bytes(current)} / {format_bytes(total)}"
+        )
+    except Exception as e:
+        pass
 
 
 # start command
@@ -251,7 +378,12 @@ async def send_help(client: Client, message: Message):
                 f"**🛑 Cancel Command:**\n" \
                 f"Use `/cancel` to immediately stop any ongoing batch process including current download/upload.\n\n" \
                 f"**💤 Session Management:**\n" \
-                f"Your session automatically goes to sleep after task completion to save resources."
+                f"Your session automatically goes to sleep after task completion to save resources.\n\n" \
+                f"**📝 File Customization:**\n" \
+                f"• Files are auto-cleaned (removes keywords)\n" \
+                f"• Prefix/Suffix added automatically\n" \
+                f"• Metadata embedded in videos/audio\n" \
+                f"• All subtitles & audio tracks preserved"
     await client.send_message(chat_id=message.chat.id, text=help_text)
 
 
@@ -570,32 +702,29 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 )
             return False
 
-    smsg = await client.send_message(message.chat.id, "**Downloading**", reply_to_message_id=message.id)
+    smsg = await client.send_message(message.chat.id, "**📥 Downloading...**", reply_to_message_id=message.id)
     
-    # Start download status task
-    down_task = asyncio.create_task(downstatus(client, f"{message.id}downstatus.txt", smsg, chat, user_id))
-
     file = None
+    start_time = time.time()
+    
     try:
         # CHECK CANCELLATION BEFORE DOWNLOAD
         if batch_temp.CANCEL_TASKS.get(user_id, False):
-            down_task.cancel()
-            if os.path.exists(f"{message.id}downstatus.txt"):
-                os.remove(f"{message.id}downstatus.txt")
             try:
                 await smsg.delete()
             except:
                 pass
             return False
         
-        # Download the file
-        file = await acc.download_media(msg, progress=progress, progress_args=[message, "down"])
+        # Download the file with progress
+        file = await acc.download_media(
+            msg, 
+            progress=progress_callback,
+            progress_args=(smsg, "download", start_time)
+        )
         
         # CHECK CANCELLATION AFTER DOWNLOAD
         if batch_temp.CANCEL_TASKS.get(user_id, False):
-            down_task.cancel()
-            if os.path.exists(f"{message.id}downstatus.txt"):
-                os.remove(f"{message.id}downstatus.txt")
             if file and os.path.exists(file):
                 os.remove(file)
             try:
@@ -604,28 +733,35 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 pass
             return False
         
-        # Clean filename
+        # Get original filename
         if file and os.path.exists(file):
             dir_name = os.path.dirname(file)
             old_filename = os.path.basename(file)
-            new_filename = clean_filename(old_filename)
-            new_file_path = os.path.join(dir_name, new_filename)
             
-            if old_filename != new_filename:
+            # Clean filename
+            cleaned_filename = clean_filename(old_filename)
+            
+            # Apply prefix and suffix
+            final_filename = apply_prefix_suffix(cleaned_filename)
+            
+            new_file_path = os.path.join(dir_name, final_filename)
+            
+            if old_filename != final_filename:
                 os.rename(file, new_file_path)
                 file = new_file_path
-        
-        # Remove download status file
-        if os.path.exists(f"{message.id}downstatus.txt"):
-            os.remove(f"{message.id}downstatus.txt")
-        
-        # Cancel download status task
-        down_task.cancel()
+            
+            # Add metadata if applicable
+            metadata_output = os.path.join(dir_name, f"meta_{final_filename}")
+            file, metadata_added = await add_metadata_with_ffmpeg(file, metadata_output, final_filename)
+            
+            # Clean up original if metadata was applied
+            if metadata_added and file == metadata_output and os.path.exists(new_file_path):
+                try:
+                    os.remove(new_file_path)
+                except:
+                    pass
         
     except Exception as e:
-        if os.path.exists(f"{message.id}downstatus.txt"):
-            os.remove(f"{message.id}downstatus.txt")
-        down_task.cancel()
         if file and os.path.exists(file):
             os.remove(file)
         if ERROR_MESSAGE:
@@ -653,12 +789,9 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
     # Update message to uploading
     try:
-        await smsg.edit("**Uploading**")
+        await smsg.edit("**📤 Uploading...**")
     except:
         pass
-    
-    # Start upload status task
-    up_task = asyncio.create_task(upstatus(client, f"{message.id}upstatus.txt", smsg, chat, user_id))
     
     caption = msg.caption if msg.caption else None
     upload_success = False
@@ -668,6 +801,8 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     if PERMANENT_THUMBNAIL_URL:
         perm_thumb = await download_thumbnail(client, PERMANENT_THUMBNAIL_URL)
 
+    start_time = time.time()
+    
     try:
         if msg_type == "Document":
             # CHECK CANCELLATION
@@ -688,14 +823,15 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 file,
                 thumb=ph_path,
                 caption=caption,
+                file_name=os.path.basename(file),
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
-                progress=progress,
-                progress_args=[message, "up"],
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time),
             )
             upload_success = True
             
-            if ph_path and os.path.exists(ph_path):
+            if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
                 os.remove(ph_path)
 
         elif msg_type == "Video":
@@ -720,28 +856,39 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 height=msg.video.height,
                 thumb=ph_path,
                 caption=caption,
+                file_name=os.path.basename(file),
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
-                progress=progress,
-                progress_args=[message, "up"],
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time),
             )
             upload_success = True
             
-            if ph_path and os.path.exists(ph_path):
+            if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
                 os.remove(ph_path)
 
         elif msg_type == "Animation":
             if batch_temp.CANCEL_TASKS.get(user_id, False):
                 raise Exception("Cancelled by user")
             
-            await client.send_animation(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+            await client.send_animation(
+                chat, 
+                file, 
+                reply_to_message_id=message.id, 
+                parse_mode=enums.ParseMode.HTML
+            )
             upload_success = True
 
         elif msg_type == "Sticker":
             if batch_temp.CANCEL_TASKS.get(user_id, False):
                 raise Exception("Cancelled by user")
             
-            await client.send_sticker(chat, file, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+            await client.send_sticker(
+                chat, 
+                file, 
+                reply_to_message_id=message.id, 
+                parse_mode=enums.ParseMode.HTML
+            )
             upload_success = True
 
         elif msg_type == "Voice":
@@ -755,8 +902,8 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 caption_entities=msg.caption_entities,
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
-                progress=progress,
-                progress_args=[message, "up"],
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time),
             )
             upload_success = True
 
@@ -778,14 +925,15 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 file,
                 thumb=ph_path,
                 caption=caption,
+                file_name=os.path.basename(file),
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
-                progress=progress,
-                progress_args=[message, "up"],
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time),
             )
             upload_success = True
             
-            if ph_path and os.path.exists(ph_path):
+            if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
                 os.remove(ph_path)
 
         elif msg_type == "Photo":
@@ -793,26 +941,33 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 raise Exception("Cancelled by user")
             
             await client.send_photo(
-                chat, file, caption=caption, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML
+                chat, 
+                file, 
+                caption=caption, 
+                reply_to_message_id=message.id, 
+                parse_mode=enums.ParseMode.HTML
             )
             upload_success = True
 
     except Exception as e:
         if "Cancelled by user" not in str(e) and ERROR_MESSAGE:
             await client.send_message(
-                message.chat.id, f"Error: {e}", reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML
+                message.chat.id, 
+                f"Error: {e}", 
+                reply_to_message_id=message.id, 
+                parse_mode=enums.ParseMode.HTML
             )
 
-    # Clean up upload status file
-    if os.path.exists(f"{message.id}upstatus.txt"):
-        os.remove(f"{message.id}upstatus.txt")
-    
-    # Cancel upload status task
-    up_task.cancel()
-    
     # Clean up downloaded file
     if file and os.path.exists(file):
         os.remove(file)
+    
+    # Clean up permanent thumbnail if it was downloaded
+    if perm_thumb and os.path.exists(perm_thumb):
+        try:
+            os.remove(perm_thumb)
+        except:
+            pass
     
     # Delete status message
     try:
