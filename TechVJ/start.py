@@ -280,7 +280,7 @@ async def stop_user_session(user_id):
             del batch_temp.ACTIVE_SESSIONS[user_id]
 
 
-UPDATE_DELAY = 1.2
+UPDATE_DELAY = 7
 SPINNER = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]
 last_edit_time = {}
 spinner_index = {}
