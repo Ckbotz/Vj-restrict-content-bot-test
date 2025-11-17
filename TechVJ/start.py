@@ -304,50 +304,81 @@ async def stop_user_session(user_id):
             del batch_temp.ACTIVE_SESSIONS[user_id]
 
 
-# Enhanced progress callback with progress bar
+# ========== CONFIG ==========
+UPDATE_DELAY = 5  # update UI every 1.2 seconds
+
+# Animated spinner frames
+SPINNER = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]
+
+# Store last edit time + spinner frame per message
+last_edit_time = {}
+spinner_index = {}
+# =============================
+
+
+# Enhanced progress callback 2.0
 async def progress_callback(current, total, message, mode, start_time):
-    """Progress callback for download/upload with visual progress bar"""
+    """Enhanced progress bar with animation + safe rate limit"""
 
-    # ---- SAFE USER ID EXTRACTION ----
-    user_id = None
-    if message is not None and getattr(message, "from_user", None) is not None:
-        user_id = message.from_user.id
+    global last_edit_time, spinner_index
 
-    # ---- USER CANCEL CHECK ----
+    # Message may be None (channel uploads), avoid crash
+    if message is None:
+        return
+
+    msg_id = message.id
+
+    # Initialize spinner index for this message
+    if msg_id not in spinner_index:
+        spinner_index[msg_id] = 0
+
+    # Limit update frequency
+    now = time.time()
+    if msg_id in last_edit_time:
+        if now - last_edit_time[msg_id] < UPDATE_DELAY:
+            return
+    last_edit_time[msg_id] = now
+
+    # Safe user ID extraction
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+
+    # Cancel check
     if user_id and batch_temp.CANCEL_TASKS.get(user_id, False):
         raise Exception("Process cancelled by user")
 
-    # ---- TIME CONTROL ----
-    now = time.time()
+    # Compute progress
     diff = now - start_time
-
-    if diff < 1:
-        return
-
-    # ---- CALCULATIONS ----
     percentage = (current / total) * 100 if total else 0
     speed = current / diff if diff > 0 else 0
     eta = (total - current) / speed if speed > 0 else 0
 
-    progress_bar = create_progress_bar(percentage)
+    # 20-bar progress
+    filled_len = int(percentage // 5)
+    bar = "▰" * filled_len + "▱" * (20 - filled_len)
 
+    # Spinner animation frame
+    spinner = SPINNER[spinner_index[msg_id] % len(SPINNER)]
+    spinner_index[msg_id] += 1
+
+    # Icons
     status_emoji = "📥" if mode == "download" else "📤"
     status_text = "Downloading" if mode == "download" else "Uploading"
 
-    # ---- SAFE EDIT ----
-    if message is None:
-        return  # message not available → nothing to edit
+    # UI TEXT (beautiful layout)
+    text = (
+        f"{spinner} **{status_emoji} {status_text}**\n\n"
+        f"**Progress:** {percentage:.1f}%\n"
+        f"`[{bar}]`\n\n"
+        f"**Speed:** {format_bytes(speed)}/s\n"
+        f"**Uploaded:** {format_bytes(current)} / {format_bytes(total)}\n"
+        f"**ETA:** {format_time(eta)}"
+    )
 
+    # Safe edit
     try:
-        await message.edit_text(
-            f"**{status_emoji} {status_text}:** {percentage:.1f}%\n"
-            f"{progress_bar}\n"
-            f"**Speed:** {format_bytes(speed)}/s\n"
-            f"**ETA:** {format_time(eta)}\n"
-            f"**Size:** {format_bytes(current)} / {format_bytes(total)}"
-        )
-    except Exception:
-        # Ignore edit errors silently (message deleted, edited by user, floodwait, etc.)
+        await message.edit_text(text)
+        await asyncio.sleep(0.05)  # protect from spam edits
+    except:
         pass
 
 
