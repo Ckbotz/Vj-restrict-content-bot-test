@@ -1,4 +1,5 @@
-FROM python:3.10.8-slim-buster
+# SOLUTION 1: Use Python 3.10 with Debian Bullseye (recommended)
+FROM python:3.10-slim-bullseye
 WORKDIR /app
 
 # Install system dependencies including ffmpeg and ffprobe
