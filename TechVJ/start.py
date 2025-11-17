@@ -307,27 +307,37 @@ async def stop_user_session(user_id):
 # Enhanced progress callback with progress bar
 async def progress_callback(current, total, message, mode, start_time):
     """Progress callback for download/upload with visual progress bar"""
-    
-    # Check if user cancelled
-    user_id = message.from_user.id if hasattr(message, 'from_user') else None
+
+    # ---- SAFE USER ID EXTRACTION ----
+    user_id = None
+    if message is not None and getattr(message, "from_user", None) is not None:
+        user_id = message.from_user.id
+
+    # ---- USER CANCEL CHECK ----
     if user_id and batch_temp.CANCEL_TASKS.get(user_id, False):
         raise Exception("Process cancelled by user")
-    
+
+    # ---- TIME CONTROL ----
     now = time.time()
     diff = now - start_time
-    
-    if diff < 1:  # Update every 1 second minimum
+
+    if diff < 1:
         return
-    
-    percentage = current * 100 / total
+
+    # ---- CALCULATIONS ----
+    percentage = (current / total) * 100 if total else 0
     speed = current / diff if diff > 0 else 0
     eta = (total - current) / speed if speed > 0 else 0
-    
+
     progress_bar = create_progress_bar(percentage)
-    
+
     status_emoji = "📥" if mode == "download" else "📤"
     status_text = "Downloading" if mode == "download" else "Uploading"
-    
+
+    # ---- SAFE EDIT ----
+    if message is None:
+        return  # message not available → nothing to edit
+
     try:
         await message.edit_text(
             f"**{status_emoji} {status_text}:** {percentage:.1f}%\n"
@@ -336,7 +346,8 @@ async def progress_callback(current, total, message, mode, start_time):
             f"**ETA:** {format_time(eta)}\n"
             f"**Size:** {format_bytes(current)} / {format_bytes(total)}"
         )
-    except Exception as e:
+    except Exception:
+        # Ignore edit errors silently (message deleted, edited by user, floodwait, etc.)
         pass
 
 
