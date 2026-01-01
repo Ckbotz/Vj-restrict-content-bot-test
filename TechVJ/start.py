@@ -37,6 +37,7 @@ WORDS_TO_REMOVE = [
     "ADL_DRAMA",
     "ADL",
     "MABLG",
+    "[DnO]",
 ]
 
 # Permanent thumbnail URL (leave empty string "" to disable)
