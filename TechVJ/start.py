@@ -339,7 +339,7 @@ async def stop_user_session(user_id):
 
 
 UPDATE_DELAY = 7
-SPINNER = ["**○**", "**◐**", "**●**", "**◑**", "**○**", "**◑**"]
+SPINNER = ["**○◐◑●**", "**◐●○◑**", "**●◑◐○**", "**◑○●◑**", "**○◑◐●**", "**◑●◐○**"]
 last_edit_time = {}
 spinner_index = {}
 
