@@ -61,6 +61,12 @@ METADATA_SUBTITLE_TITLE = os.environ.get("METADATA_SUBTITLE_TITLE", "").strip() 
 # =========================================
 
 
+# Custom exception for cancellation
+class ProcessCancelled(Exception):
+    """Custom exception for user-initiated cancellation"""
+    pass
+
+
 class batch_temp(object):
     IS_BATCH = {}
     CUSTOM_SLEEP = {}
@@ -280,7 +286,7 @@ async def smart_sleep(user_id):
     sleep_chunks = int(final_sleep / 0.2)
     for _ in range(sleep_chunks):
         if batch_temp.CANCEL_TASKS.get(user_id, False):
-            raise Exception("Cancelled by user")
+            raise ProcessCancelled("Process cancelled by user")
         await asyncio.sleep(0.2)
 
 
@@ -333,7 +339,7 @@ async def stop_user_session(user_id):
 
 
 UPDATE_DELAY = 7
-SPINNER = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"]
+SPINNER = ["**○**", "**◐**", "**●**", "**◑**", "**○**", "**◑**"]
 last_edit_time = {}
 spinner_index = {}
 
@@ -358,9 +364,9 @@ async def progress_callback(current, total, message, mode, start_time):
         if user_id:
             user_id = user_id.id
 
-    # Check for cancellation MORE FREQUENTLY
+    # Check for cancellation MORE FREQUENTLY - raise custom exception
     if user_id and batch_temp.CANCEL_TASKS.get(user_id, False):
-        raise pyrogram.errors.exceptions.bad_request_400.BadRequest("Cancelled by user")
+        raise ProcessCancelled("Process cancelled by user")
 
     if msg_id in last_edit_time:
         if now - last_edit_time[msg_id] < UPDATE_DELAY:
@@ -373,7 +379,7 @@ async def progress_callback(current, total, message, mode, start_time):
     eta = (total - current) / speed if speed > 0 else 0
 
     filled_len = int(percentage // 5)
-    bar = "▰" * filled_len + "▱" * (20 - filled_len)
+    bar = "**▰**" * filled_len + "**▱**" * (20 - filled_len)
 
     spinner = SPINNER[spinner_index[msg_id] % len(SPINNER)]
     spinner_index[msg_id] += 1
@@ -544,7 +550,7 @@ async def send_cancel(client: Client, message: Message):
         text="**🛑 CANCELLING ALL PROCESSES IMMEDIATELY!**\n\n"
              "⚠️ Stopping current download/upload...\n"
              "⚠️ Cleaning up temporary files...\n"
-             "⚠️ Session will be put to sleep...",
+             "⚠️ Session will be terminated...",
         reply_to_message_id=message.id
     )
     
@@ -647,9 +653,9 @@ async def save(client: Client, message: Message):
                         success = await handle_private(client, acc, message, chatid, msgid)
                         if success:
                             completed += 1
+                    except ProcessCancelled:
+                        break
                     except Exception as e:
-                        if "Cancelled by user" in str(e):
-                            break
                         if ERROR_MESSAGE:
                             await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
@@ -659,9 +665,9 @@ async def save(client: Client, message: Message):
                         success = await handle_private(client, acc, message, username, msgid)
                         if success:
                             completed += 1
+                    except ProcessCancelled:
+                        break
                     except Exception as e:
-                        if "Cancelled by user" in str(e):
-                            break
                         if ERROR_MESSAGE:
                             await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
@@ -685,9 +691,9 @@ async def save(client: Client, message: Message):
                             success = await handle_private(client, acc, message, username, msgid)
                             if success:
                                 completed += 1
+                        except ProcessCancelled:
+                            break
                         except Exception as e:
-                            if "Cancelled by user" in str(e):
-                                break
                             if ERROR_MESSAGE:
                                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
@@ -705,15 +711,14 @@ async def save(client: Client, message: Message):
                 if msgid < toID:
                     try:
                         await smart_sleep(user_id)
-                    except Exception as e:
-                        if "Cancelled by user" in str(e):
-                            await client.send_message(
-                                message.chat.id,
-                                f"**🛑 Process Cancelled During Sleep!**\n\n"
-                                f"✅ Completed: {completed}/{total_items} items",
-                                reply_to_message_id=message.id
-                            )
-                            break
+                    except ProcessCancelled:
+                        await client.send_message(
+                            message.chat.id,
+                            f"**🛑 Process Cancelled During Sleep!**\n\n"
+                            f"✅ Completed: {completed}/{total_items} items",
+                            reply_to_message_id=message.id
+                        )
+                        break
                     
                 if completed % 5 == 0 and completed < total_items and completed > 0:
                     try:
@@ -725,9 +730,16 @@ async def save(client: Client, message: Message):
                     except:
                         pass
 
+        except ProcessCancelled:
+            await client.send_message(
+                message.chat.id,
+                f"**🛑 Batch Process Cancelled!**\n\n"
+                f"✅ Completed: {completed}/{total_items} items\n"
+                f"💤 Session terminated.",
+                reply_to_message_id=message.id
+            )
         except Exception as e:
-            if "Cancelled by user" not in str(e):
-                print(f"Error in batch process: {e}")
+            print(f"Error in batch process: {e}")
         finally:
             batch_temp.IS_BATCH[user_id] = True
             batch_temp.CANCEL_TASKS[user_id] = False
@@ -754,7 +766,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     
     # Early cancel check
     if batch_temp.CANCEL_TASKS.get(user_id, False):
-        raise Exception("Cancelled by user")
+        raise ProcessCancelled("Process cancelled by user")
     
     msg: Message = await acc.get_messages(chatid, msgid)
     if msg.empty:
@@ -768,7 +780,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     
     # Check cancel again
     if batch_temp.CANCEL_TASKS.get(user_id, False):
-        raise Exception("Cancelled by user")
+        raise ProcessCancelled("Process cancelled by user")
 
     if msg_type == "Text":
         try:
@@ -805,7 +817,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 await smsg.delete()
             except:
                 pass
-            raise Exception("Cancelled by user")
+            raise ProcessCancelled("Process cancelled by user")
         
         # Create download task and store reference for cancellation
         download_task = asyncio.create_task(
@@ -821,7 +833,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         try:
             file = await download_task
         except asyncio.CancelledError:
-            raise Exception("Cancelled by user")
+            raise ProcessCancelled("Process cancelled by user")
         finally:
             if user_id in batch_temp.DOWNLOAD_TASKS:
                 del batch_temp.DOWNLOAD_TASKS[user_id]
@@ -837,7 +849,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 await smsg.delete()
             except:
                 pass
-            raise Exception("Cancelled by user")
+            raise ProcessCancelled("Process cancelled by user")
         
         if file and os.path.exists(file):
             dir_name = os.path.dirname(file)
@@ -863,22 +875,27 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                     await smsg.delete()
                 except:
                     pass
-                raise Exception("Cancelled by user")
+                raise ProcessCancelled("Process cancelled by user")
             
             file, metadata_added = await add_metadata_with_ffmpeg(file, final_filename)
         
+    except ProcessCancelled:
+        if file and os.path.exists(file):
+            try:
+                os.remove(file)
+            except:
+                pass
+        try:
+            await smsg.delete()
+        except:
+            pass
+        raise
     except Exception as e:
         if file and os.path.exists(file):
             try:
                 os.remove(file)
             except:
                 pass
-        if "Cancelled by user" in str(e):
-            try:
-                await smsg.delete()
-            except:
-                pass
-            raise
         if ERROR_MESSAGE:
             await client.send_message(
                 message.chat.id,
@@ -903,7 +920,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             await smsg.delete()
         except:
             pass
-        raise Exception("Cancelled by user")
+        raise ProcessCancelled("Process cancelled by user")
 
     try:
         await smsg.edit("**📤 Uploading...**")
@@ -922,7 +939,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     try:
         if msg_type == "Document":
             if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
+                raise ProcessCancelled("Process cancelled by user")
             
             if perm_thumb:
                 ph_path = perm_thumb
@@ -950,7 +967,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
         elif msg_type == "Video":
             if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
+                raise ProcessCancelled("Process cancelled by user")
             
             if perm_thumb:
                 ph_path = perm_thumb
@@ -981,7 +998,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
         elif msg_type == "Animation":
             if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
+                raise ProcessCancelled("Process cancelled by user")
             
             await client.send_animation(
                 chat, 
@@ -993,7 +1010,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
         elif msg_type == "Sticker":
             if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
+                raise ProcessCancelled("Process cancelled by user")
             
             await client.send_sticker(
                 chat, 
@@ -1005,7 +1022,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
         elif msg_type == "Voice":
             if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
+                raise ProcessCancelled("Process cancelled by user")
             
             await client.send_voice(
                 chat,
@@ -1021,7 +1038,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
         elif msg_type == "Audio":
             if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
+                raise ProcessCancelled("Process cancelled by user")
             
             if perm_thumb:
                 ph_path = perm_thumb
@@ -1049,7 +1066,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
         elif msg_type == "Photo":
             if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
+                raise ProcessCancelled("Process cancelled by user")
             
             await client.send_photo(
                 chat, 
@@ -1060,9 +1077,9 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             )
             upload_success = True
 
+    except ProcessCancelled:
+        raise
     except Exception as e:
-        if "Cancelled by user" in str(e):
-            raise
         if ERROR_MESSAGE:
             await client.send_message(
                 message.chat.id, 
