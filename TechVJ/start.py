@@ -53,6 +53,11 @@ METADATA_AUTHOR = os.environ.get("METADATA_AUTHOR", "").strip() or None
 METADATA_ARTIST = os.environ.get("METADATA_ARTIST", "").strip() or None
 METADATA_DESCRIPTION = os.environ.get("METADATA_DESCRIPTION", "uploaded by @Dramaship").strip() or None
 METADATA_COMMENT = os.environ.get("METADATA_COMMENT", "").strip() or None
+
+# Video/Audio/Subtitle Stream Title settings
+METADATA_VIDEO_TITLE = os.environ.get("METADATA_VIDEO_TITLE", "{file_name}").strip() or None
+METADATA_AUDIO_TITLE = os.environ.get("METADATA_AUDIO_TITLE", "{file_name}").strip() or None
+METADATA_SUBTITLE_TITLE = os.environ.get("METADATA_SUBTITLE_TITLE", "{file_name}").strip() or None
 # =========================================
 
 
@@ -147,9 +152,14 @@ async def download_thumbnail(client, url):
 
 
 async def add_metadata_with_ffmpeg(input_file, final_filename):
-    """Add metadata to video/audio files using ffmpeg while preserving all streams"""
+    """Add metadata to video/audio files using ffmpeg while preserving all streams and adding stream titles
     
-    if not any([METADATA_TITLE, METADATA_AUTHOR, METADATA_ARTIST, METADATA_DESCRIPTION, METADATA_COMMENT]):
+    If metadata variables are blank/None, original metadata is preserved.
+    If metadata variables are set, they override original metadata.
+    """
+    
+    if not any([METADATA_TITLE, METADATA_AUTHOR, METADATA_ARTIST, METADATA_DESCRIPTION, 
+                METADATA_COMMENT, METADATA_VIDEO_TITLE, METADATA_AUDIO_TITLE, METADATA_SUBTITLE_TITLE]):
         return input_file, False
     
     ext = input_file.rsplit('.', 1)[-1].lower()
@@ -167,12 +177,28 @@ async def add_metadata_with_ffmpeg(input_file, final_filename):
         dir_name = os.path.dirname(input_file)
         output_file = os.path.join(dir_name, f"temp_meta_{random.randint(1000, 9999)}.{ext}")
         
+        # First, probe the file to get stream information
+        probe_cmd = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_streams', input_file
+        ]
+        
+        try:
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+            import json
+            probe_data = json.loads(probe_result.stdout)
+            streams = probe_data.get('streams', [])
+        except:
+            streams = []
+        
         cmd = [
             'ffmpeg', '-i', input_file,
             '-map', '0',
-            '-c', 'copy'
+            '-c', 'copy',
+            '-map_metadata', '0'  # Preserve all original metadata by default
         ]
         
+        # Add/override global metadata only if set
         if METADATA_TITLE:
             title = METADATA_TITLE.format(file_name=final_filename)
             cmd.extend(['-metadata', f'title={title}'])
@@ -188,6 +214,28 @@ async def add_metadata_with_ffmpeg(input_file, final_filename):
         if METADATA_COMMENT:
             comment = METADATA_COMMENT.format(file_name=final_filename)
             cmd.extend(['-metadata', f'comment={comment}'])
+        
+        # Add stream-specific metadata only if set (preserves original if not set)
+        for idx, stream in enumerate(streams):
+            codec_type = stream.get('codec_type', '').lower()
+            
+            if codec_type == 'video' and METADATA_VIDEO_TITLE:
+                video_title = METADATA_VIDEO_TITLE.format(file_name=final_filename)
+                # Count video streams before this one
+                video_idx = sum(1 for s in streams[:idx] if s.get('codec_type') == 'video')
+                cmd.extend([f'-metadata:s:v:{video_idx}', f'title={video_title}'])
+            
+            elif codec_type == 'audio' and METADATA_AUDIO_TITLE:
+                audio_title = METADATA_AUDIO_TITLE.format(file_name=final_filename)
+                # Count audio streams before this one
+                audio_idx = sum(1 for s in streams[:idx] if s.get('codec_type') == 'audio')
+                cmd.extend([f'-metadata:s:a:{audio_idx}', f'title={audio_title}'])
+            
+            elif codec_type == 'subtitle' and METADATA_SUBTITLE_TITLE:
+                subtitle_title = METADATA_SUBTITLE_TITLE.format(file_name=final_filename)
+                # Count subtitle streams before this one
+                subtitle_idx = sum(1 for s in streams[:idx] if s.get('codec_type') == 'subtitle')
+                cmd.extend([f'-metadata:s:s:{subtitle_idx}', f'title={subtitle_title}'])
         
         cmd.extend(['-y', output_file])
         
@@ -229,6 +277,276 @@ async def smart_sleep(user_id):
     sleep_chunks = int(final_sleep / 0.5)
     for _ in range(sleep_chunks):
         if batch_temp.CANCEL_TASKS.get(user_id, False):
+            if file and os.path.exists(file):
+                os.remove(file)
+            try:
+                await smsg.delete()
+            except:
+                pass
+            return False
+        
+        if file and os.path.exists(file):
+            dir_name = os.path.dirname(file)
+            old_filename = os.path.basename(file)
+            
+            cleaned_filename = clean_filename(old_filename)
+            final_filename = apply_prefix_suffix(cleaned_filename)
+            
+            new_file_path = os.path.join(dir_name, final_filename)
+            
+            if old_filename != final_filename:
+                os.rename(file, new_file_path)
+                file = new_file_path
+            
+            file, metadata_added = await add_metadata_with_ffmpeg(file, final_filename)
+        
+    except Exception as e:
+        if file and os.path.exists(file):
+            os.remove(file)
+        if ERROR_MESSAGE:
+            await client.send_message(
+                message.chat.id,
+                f"Error: {e}",
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML,
+            )
+        try:
+            await smsg.delete()
+        except:
+            pass
+        return False
+
+    if batch_temp.CANCEL_TASKS.get(user_id, False):
+        if file and os.path.exists(file):
+            os.remove(file)
+        try:
+            await smsg.delete()
+        except:
+            pass
+        return False
+
+    try:
+        await smsg.edit("**📤 Uploading...**")
+    except:
+        pass
+    
+    caption = msg.caption if msg.caption else None
+    upload_success = False
+    
+    perm_thumb = None
+    if PERMANENT_THUMBNAIL_URL:
+        perm_thumb = await download_thumbnail(client, PERMANENT_THUMBNAIL_URL)
+
+    start_time = time.time()
+    
+    try:
+        if msg_type == "Document":
+            if batch_temp.CANCEL_TASKS.get(user_id, False):
+                raise Exception("Cancelled by user")
+            
+            if perm_thumb:
+                ph_path = perm_thumb
+            else:
+                try:
+                    ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
+                except:
+                    ph_path = None
+            
+            await client.send_document(
+                chat,
+                file,
+                thumb=ph_path,
+                caption=caption,
+                file_name=os.path.basename(file),
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time),
+            )
+            upload_success = True
+            
+            if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
+                os.remove(ph_path)
+
+        elif msg_type == "Video":
+            if batch_temp.CANCEL_TASKS.get(user_id, False):
+                raise Exception("Cancelled by user")
+            
+            if perm_thumb:
+                ph_path = perm_thumb
+            else:
+                try:
+                    ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
+                except:
+                    ph_path = None
+            
+            await client.send_video(
+                chat,
+                file,
+                duration=msg.video.duration,
+                width=msg.video.width,
+                height=msg.video.height,
+                thumb=ph_path,
+                caption=caption,
+                file_name=os.path.basename(file),
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time),
+            )
+            upload_success = True
+            
+            if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
+                os.remove(ph_path)
+
+        elif msg_type == "Animation":
+            if batch_temp.CANCEL_TASKS.get(user_id, False):
+                raise Exception("Cancelled by user")
+            
+            await client.send_animation(
+                chat, 
+                file, 
+                reply_to_message_id=message.id, 
+                parse_mode=enums.ParseMode.HTML
+            )
+            upload_success = True
+
+        elif msg_type == "Sticker":
+            if batch_temp.CANCEL_TASKS.get(user_id, False):
+                raise Exception("Cancelled by user")
+            
+            await client.send_sticker(
+                chat, 
+                file, 
+                reply_to_message_id=message.id, 
+                parse_mode=enums.ParseMode.HTML
+            )
+            upload_success = True
+
+        elif msg_type == "Voice":
+            if batch_temp.CANCEL_TASKS.get(user_id, False):
+                raise Exception("Cancelled by user")
+            
+            await client.send_voice(
+                chat,
+                file,
+                caption=caption,
+                caption_entities=msg.caption_entities,
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time),
+            )
+            upload_success = True
+
+        elif msg_type == "Audio":
+            if batch_temp.CANCEL_TASKS.get(user_id, False):
+                raise Exception("Cancelled by user")
+            
+            if perm_thumb:
+                ph_path = perm_thumb
+            else:
+                try:
+                    ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
+                except:
+                    ph_path = None
+            
+            await client.send_audio(
+                chat,
+                file,
+                thumb=ph_path,
+                caption=caption,
+                file_name=os.path.basename(file),
+                reply_to_message_id=message.id,
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress_callback,
+                progress_args=(smsg, "upload", start_time),
+            )
+            upload_success = True
+            
+            if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
+                os.remove(ph_path)
+
+        elif msg_type == "Photo":
+            if batch_temp.CANCEL_TASKS.get(user_id, False):
+                raise Exception("Cancelled by user")
+            
+            await client.send_photo(
+                chat, 
+                file, 
+                caption=caption, 
+                reply_to_message_id=message.id, 
+                parse_mode=enums.ParseMode.HTML
+            )
+            upload_success = True
+
+    except Exception as e:
+        if "Cancelled by user" not in str(e) and ERROR_MESSAGE:
+            await client.send_message(
+                message.chat.id, 
+                f"Error: {e}", 
+                reply_to_message_id=message.id, 
+                parse_mode=enums.ParseMode.HTML
+            )
+
+    if file and os.path.exists(file):
+        os.remove(file)
+    
+    if perm_thumb and os.path.exists(perm_thumb):
+        try:
+            os.remove(perm_thumb)
+        except:
+            pass
+    
+    try:
+        await client.delete_messages(message.chat.id, [smsg.id])
+    except:
+        pass
+
+    return upload_success
+
+
+def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
+    try:
+        msg.document.file_id
+        return "Document"
+    except:
+        pass
+    try:
+        msg.video.file_id
+        return "Video"
+    except:
+        pass
+    try:
+        msg.animation.file_id
+        return "Animation"
+    except:
+        pass
+    try:
+        msg.sticker.file_id
+        return "Sticker"
+    except:
+        pass
+    try:
+        msg.voice.file_id
+        return "Voice"
+    except:
+        pass
+    try:
+        msg.audio.file_id
+        return "Audio"
+    except:
+        pass
+    try:
+        msg.photo.file_id
+        return "Photo"
+    except:
+        pass
+    try:
+        msg.text
+        return "Text"
+    except:
+        passCANCEL_TASKS.get(user_id, False):
             break
         await asyncio.sleep(0.5)
 
@@ -381,6 +699,7 @@ async def send_help(client: Client, message: Message):
                 f"• Files are auto-cleaned (removes keywords)\n" \
                 f"• Prefix/Suffix added automatically\n" \
                 f"• Metadata embedded in videos/audio\n" \
+                f"• Stream titles (video/audio/subtitle) added\n" \
                 f"• All subtitles & audio tracks preserved"
     await client.send_message(chat_id=message.chat.id, text=help_text)
 
@@ -694,274 +1013,4 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             progress_args=(smsg, "download", start_time)
         )
         
-        if batch_temp.CANCEL_TASKS.get(user_id, False):
-            if file and os.path.exists(file):
-                os.remove(file)
-            try:
-                await smsg.delete()
-            except:
-                pass
-            return False
-        
-        if file and os.path.exists(file):
-            dir_name = os.path.dirname(file)
-            old_filename = os.path.basename(file)
-            
-            cleaned_filename = clean_filename(old_filename)
-            final_filename = apply_prefix_suffix(cleaned_filename)
-            
-            new_file_path = os.path.join(dir_name, final_filename)
-            
-            if old_filename != final_filename:
-                os.rename(file, new_file_path)
-                file = new_file_path
-            
-            file, metadata_added = await add_metadata_with_ffmpeg(file, final_filename)
-        
-    except Exception as e:
-        if file and os.path.exists(file):
-            os.remove(file)
-        if ERROR_MESSAGE:
-            await client.send_message(
-                message.chat.id,
-                f"Error: {e}",
-                reply_to_message_id=message.id,
-                parse_mode=enums.ParseMode.HTML,
-            )
-        try:
-            await smsg.delete()
-        except:
-            pass
-        return False
-
-    if batch_temp.CANCEL_TASKS.get(user_id, False):
-        if file and os.path.exists(file):
-            os.remove(file)
-        try:
-            await smsg.delete()
-        except:
-            pass
-        return False
-
-    try:
-        await smsg.edit("**📤 Uploading...**")
-    except:
-        pass
-    
-    caption = msg.caption if msg.caption else None
-    upload_success = False
-    
-    perm_thumb = None
-    if PERMANENT_THUMBNAIL_URL:
-        perm_thumb = await download_thumbnail(client, PERMANENT_THUMBNAIL_URL)
-
-    start_time = time.time()
-    
-    try:
-        if msg_type == "Document":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
-            
-            if perm_thumb:
-                ph_path = perm_thumb
-            else:
-                try:
-                    ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
-                except:
-                    ph_path = None
-            
-            await client.send_document(
-                chat,
-                file,
-                thumb=ph_path,
-                caption=caption,
-                file_name=os.path.basename(file),
-                reply_to_message_id=message.id,
-                parse_mode=enums.ParseMode.HTML,
-                progress=progress_callback,
-                progress_args=(smsg, "upload", start_time),
-            )
-            upload_success = True
-            
-            if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
-                os.remove(ph_path)
-
-        elif msg_type == "Video":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
-            
-            if perm_thumb:
-                ph_path = perm_thumb
-            else:
-                try:
-                    ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
-                except:
-                    ph_path = None
-            
-            await client.send_video(
-                chat,
-                file,
-                duration=msg.video.duration,
-                width=msg.video.width,
-                height=msg.video.height,
-                thumb=ph_path,
-                caption=caption,
-                file_name=os.path.basename(file),
-                reply_to_message_id=message.id,
-                parse_mode=enums.ParseMode.HTML,
-                progress=progress_callback,
-                progress_args=(smsg, "upload", start_time),
-            )
-            upload_success = True
-            
-            if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
-                os.remove(ph_path)
-
-        elif msg_type == "Animation":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
-            
-            await client.send_animation(
-                chat, 
-                file, 
-                reply_to_message_id=message.id, 
-                parse_mode=enums.ParseMode.HTML
-            )
-            upload_success = True
-
-        elif msg_type == "Sticker":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
-            
-            await client.send_sticker(
-                chat, 
-                file, 
-                reply_to_message_id=message.id, 
-                parse_mode=enums.ParseMode.HTML
-            )
-            upload_success = True
-
-        elif msg_type == "Voice":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
-            
-            await client.send_voice(
-                chat,
-                file,
-                caption=caption,
-                caption_entities=msg.caption_entities,
-                reply_to_message_id=message.id,
-                parse_mode=enums.ParseMode.HTML,
-                progress=progress_callback,
-                progress_args=(smsg, "upload", start_time),
-            )
-            upload_success = True
-
-        elif msg_type == "Audio":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
-            
-            if perm_thumb:
-                ph_path = perm_thumb
-            else:
-                try:
-                    ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
-                except:
-                    ph_path = None
-            
-            await client.send_audio(
-                chat,
-                file,
-                thumb=ph_path,
-                caption=caption,
-                file_name=os.path.basename(file),
-                reply_to_message_id=message.id,
-                parse_mode=enums.ParseMode.HTML,
-                progress=progress_callback,
-                progress_args=(smsg, "upload", start_time),
-            )
-            upload_success = True
-            
-            if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
-                os.remove(ph_path)
-
-        elif msg_type == "Photo":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
-                raise Exception("Cancelled by user")
-            
-            await client.send_photo(
-                chat, 
-                file, 
-                caption=caption, 
-                reply_to_message_id=message.id, 
-                parse_mode=enums.ParseMode.HTML
-            )
-            upload_success = True
-
-    except Exception as e:
-        if "Cancelled by user" not in str(e) and ERROR_MESSAGE:
-            await client.send_message(
-                message.chat.id, 
-                f"Error: {e}", 
-                reply_to_message_id=message.id, 
-                parse_mode=enums.ParseMode.HTML
-            )
-
-    if file and os.path.exists(file):
-        os.remove(file)
-    
-    if perm_thumb and os.path.exists(perm_thumb):
-        try:
-            os.remove(perm_thumb)
-        except:
-            pass
-    
-    try:
-        await client.delete_messages(message.chat.id, [smsg.id])
-    except:
-        pass
-
-    return upload_success
-
-
-def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
-    try:
-        msg.document.file_id
-        return "Document"
-    except:
-        pass
-    try:
-        msg.video.file_id
-        return "Video"
-    except:
-        pass
-    try:
-        msg.animation.file_id
-        return "Animation"
-    except:
-        pass
-    try:
-        msg.sticker.file_id
-        return "Sticker"
-    except:
-        pass
-    try:
-        msg.voice.file_id
-        return "Voice"
-    except:
-        pass
-    try:
-        msg.audio.file_id
-        return "Audio"
-    except:
-        pass
-    try:
-        msg.photo.file_id
-        return "Photo"
-    except:
-        pass
-    try:
-        msg.text
-        return "Text"
-    except:
-        pass
+        if batch_temp.
