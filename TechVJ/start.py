@@ -379,7 +379,7 @@ async def progress_callback(current, total, message, mode, start_time):
     eta = (total - current) / speed if speed > 0 else 0
 
     filled_len = int(percentage // 5)
-    bar = "**▰**" * filled_len + "**▱**" * (20 - filled_len)
+    bar = "▰" * filled_len + "▱" * (20 - filled_len)
 
     spinner = SPINNER[spinner_index[msg_id] % len(SPINNER)]
     spinner_index[msg_id] += 1
