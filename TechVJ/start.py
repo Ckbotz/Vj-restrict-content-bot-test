@@ -19,7 +19,7 @@ from pyrogram.errors import (
     InviteHashExpired,
     UsernameNotOccupied
 )
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from config import API_ID, API_HASH, ERROR_MESSAGE, LOGIN_SYSTEM, STRING_SESSION
 from database.db import db
 from TechVJ.strings import HELP_TXT
@@ -49,10 +49,15 @@ FILE_SUFFIX = os.environ.get("FILE_SUFFIX", "@DramaShip").strip() or None
 
 # Metadata settings
 METADATA_TITLE = os.environ.get("METADATA_TITLE", "{file_name}").strip() or None
-METADATA_AUTHOR = os.environ.get("METADATA_AUTHOR", "").strip() or None
-METADATA_ARTIST = os.environ.get("METADATA_ARTIST", "").strip() or None
+METADATA_AUTHOR = os.environ.get("METADATA_AUTHOR", "@DramaShip").strip() or None
+METADATA_ARTIST = os.environ.get("METADATA_ARTIST", "@DramaShip").strip() or None
 METADATA_DESCRIPTION = os.environ.get("METADATA_DESCRIPTION", "uploaded by @Dramaship").strip() or None
-METADATA_COMMENT = os.environ.get("METADATA_COMMENT", "").strip() or None
+METADATA_COMMENT = os.environ.get("METADATA_COMMENT", "@DramaShip").strip() or None
+
+# Video/Audio/Subtitle Stream Title settings
+METADATA_VIDEO_TITLE = os.environ.get("METADATA_VIDEO_TITLE", "@DramaShip").strip() or None
+METADATA_AUDIO_TITLE = os.environ.get("METADATA_AUDIO_TITLE", "@DramaShip").strip() or None
+METADATA_SUBTITLE_TITLE = os.environ.get("METADATA_SUBTITLE_TITLE", "").strip() or None
 # =========================================
 
 
@@ -61,6 +66,8 @@ class batch_temp(object):
     CUSTOM_SLEEP = {}
     CANCEL_TASKS = {}
     ACTIVE_SESSIONS = {}
+    DOWNLOAD_TASKS = {}  # Store download task references
+    PROGRESS_MESSAGES = {}  # Store progress message IDs
 
 
 def clean_filename(filename):
@@ -147,9 +154,14 @@ async def download_thumbnail(client, url):
 
 
 async def add_metadata_with_ffmpeg(input_file, final_filename):
-    """Add metadata to video/audio files using ffmpeg while preserving all streams"""
+    """Add metadata to video/audio files using ffmpeg while preserving all streams and adding stream titles
     
-    if not any([METADATA_TITLE, METADATA_AUTHOR, METADATA_ARTIST, METADATA_DESCRIPTION, METADATA_COMMENT]):
+    If metadata variables are blank/None, original metadata is preserved.
+    If metadata variables are set, they override original metadata.
+    """
+    
+    if not any([METADATA_TITLE, METADATA_AUTHOR, METADATA_ARTIST, METADATA_DESCRIPTION, 
+                METADATA_COMMENT, METADATA_VIDEO_TITLE, METADATA_AUDIO_TITLE, METADATA_SUBTITLE_TITLE]):
         return input_file, False
     
     ext = input_file.rsplit('.', 1)[-1].lower()
@@ -167,12 +179,28 @@ async def add_metadata_with_ffmpeg(input_file, final_filename):
         dir_name = os.path.dirname(input_file)
         output_file = os.path.join(dir_name, f"temp_meta_{random.randint(1000, 9999)}.{ext}")
         
+        # First, probe the file to get stream information
+        probe_cmd = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_streams', input_file
+        ]
+        
+        try:
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+            import json
+            probe_data = json.loads(probe_result.stdout)
+            streams = probe_data.get('streams', [])
+        except:
+            streams = []
+        
         cmd = [
             'ffmpeg', '-i', input_file,
             '-map', '0',
-            '-c', 'copy'
+            '-c', 'copy',
+            '-map_metadata', '0'  # Preserve all original metadata by default
         ]
         
+        # Add/override global metadata only if set
         if METADATA_TITLE:
             title = METADATA_TITLE.format(file_name=final_filename)
             cmd.extend(['-metadata', f'title={title}'])
@@ -188,6 +216,28 @@ async def add_metadata_with_ffmpeg(input_file, final_filename):
         if METADATA_COMMENT:
             comment = METADATA_COMMENT.format(file_name=final_filename)
             cmd.extend(['-metadata', f'comment={comment}'])
+        
+        # Add stream-specific metadata only if set (preserves original if not set)
+        for idx, stream in enumerate(streams):
+            codec_type = stream.get('codec_type', '').lower()
+            
+            if codec_type == 'video' and METADATA_VIDEO_TITLE:
+                video_title = METADATA_VIDEO_TITLE.format(file_name=final_filename)
+                # Count video streams before this one
+                video_idx = sum(1 for s in streams[:idx] if s.get('codec_type') == 'video')
+                cmd.extend([f'-metadata:s:v:{video_idx}', f'title={video_title}'])
+            
+            elif codec_type == 'audio' and METADATA_AUDIO_TITLE:
+                audio_title = METADATA_AUDIO_TITLE.format(file_name=final_filename)
+                # Count audio streams before this one
+                audio_idx = sum(1 for s in streams[:idx] if s.get('codec_type') == 'audio')
+                cmd.extend([f'-metadata:s:a:{audio_idx}', f'title={audio_title}'])
+            
+            elif codec_type == 'subtitle' and METADATA_SUBTITLE_TITLE:
+                subtitle_title = METADATA_SUBTITLE_TITLE.format(file_name=final_filename)
+                # Count subtitle streams before this one
+                subtitle_idx = sum(1 for s in streams[:idx] if s.get('codec_type') == 'subtitle')
+                cmd.extend([f'-metadata:s:s:{subtitle_idx}', f'title={subtitle_title}'])
         
         cmd.extend(['-y', output_file])
         
@@ -220,17 +270,18 @@ async def add_metadata_with_ffmpeg(input_file, final_filename):
 
 
 async def smart_sleep(user_id):
-    """Intelligent sleep with randomization to avoid detection"""
+    """Intelligent sleep with randomization and cancel check"""
     base_sleep = batch_temp.CUSTOM_SLEEP.get(user_id, [3, 5, 7, 10])
     sleep_time = random.choice(base_sleep)
     jitter = random.uniform(-0.2, 0.2) * sleep_time
     final_sleep = sleep_time + jitter
     
-    sleep_chunks = int(final_sleep / 0.5)
+    # Check every 0.2 seconds for more responsive cancellation
+    sleep_chunks = int(final_sleep / 0.2)
     for _ in range(sleep_chunks):
         if batch_temp.CANCEL_TASKS.get(user_id, False):
-            break
-        await asyncio.sleep(0.5)
+            raise Exception("Cancelled by user")
+        await asyncio.sleep(0.2)
 
 
 async def get_user_session(user_id):
@@ -288,7 +339,7 @@ spinner_index = {}
 
 
 async def progress_callback(current, total, message, mode, start_time):
-    """Enhanced progress bar with animation + safe rate limit"""
+    """Enhanced progress bar with cancel button and frequent cancel checks"""
     global last_edit_time, spinner_index
 
     if message is None:
@@ -300,15 +351,21 @@ async def progress_callback(current, total, message, mode, start_time):
         spinner_index[msg_id] = 0
 
     now = time.time()
+    
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    if not user_id:
+        user_id = getattr(message, "chat", None)
+        if user_id:
+            user_id = user_id.id
+
+    # Check for cancellation MORE FREQUENTLY
+    if user_id and batch_temp.CANCEL_TASKS.get(user_id, False):
+        raise pyrogram.errors.exceptions.bad_request_400.BadRequest("Cancelled by user")
+
     if msg_id in last_edit_time:
         if now - last_edit_time[msg_id] < UPDATE_DELAY:
             return
     last_edit_time[msg_id] = now
-
-    user_id = getattr(getattr(message, "from_user", None), "id", None)
-
-    if user_id and batch_temp.CANCEL_TASKS.get(user_id, False):
-        raise Exception("Process cancelled by user")
 
     diff = now - start_time
     percentage = (current / total) * 100 if total else 0
@@ -333,9 +390,40 @@ async def progress_callback(current, total, message, mode, start_time):
         f"**ETA:** {format_time(eta)}"
     )
 
+    # Add cancel button
+    cancel_button = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 Cancel Process", callback_data=f"cancel_{user_id}")]
+    ])
+
     try:
-        await message.edit_text(text)
+        await message.edit_text(text, reply_markup=cancel_button)
         await asyncio.sleep(0.05)
+    except:
+        pass
+
+
+@Client.on_callback_query(filters.regex(r"^cancel_"))
+async def cancel_callback(client: Client, callback_query: CallbackQuery):
+    """Handle cancel button press"""
+    data = callback_query.data
+    user_id = int(data.split("_")[1])
+    
+    if callback_query.from_user.id != user_id:
+        await callback_query.answer("⚠️ This is not your process!", show_alert=True)
+        return
+    
+    batch_temp.CANCEL_TASKS[user_id] = True
+    batch_temp.IS_BATCH[user_id] = True
+    
+    await callback_query.answer("🛑 Cancelling process...", show_alert=True)
+    
+    try:
+        await callback_query.message.edit_text(
+            "**🛑 CANCELLATION IN PROGRESS**\n\n"
+            "⚠️ Stopping current operation...\n"
+            "⚠️ Cleaning up files...\n"
+            "⚠️ Session will be terminated..."
+        )
     except:
         pass
 
@@ -374,13 +462,15 @@ async def send_help(client: Client, message: Message):
                 f"Example: `/setsleep 3 5 7 10` (bot will randomly pick from these values)\n\n" \
                 f"Use `/getsleep` to see your current sleep settings.\n\n" \
                 f"**🛑 Cancel Command:**\n" \
-                f"Use `/cancel` to immediately stop any ongoing batch process including current download/upload.\n\n" \
+                f"Use `/cancel` to immediately stop any ongoing batch process.\n" \
+                f"You can also click the 'Cancel' button during download/upload.\n\n" \
                 f"**💤 Session Management:**\n" \
                 f"Your session automatically goes to sleep after task completion to save resources.\n\n" \
                 f"**📝 File Customization:**\n" \
                 f"• Files are auto-cleaned (removes keywords)\n" \
                 f"• Prefix/Suffix added automatically\n" \
                 f"• Metadata embedded in videos/audio\n" \
+                f"• Stream titles (video/audio/subtitle) added\n" \
                 f"• All subtitles & audio tracks preserved"
     await client.send_message(chat_id=message.chat.id, text=help_text)
 
@@ -442,16 +532,23 @@ async def send_cancel(client: Client, message: Message):
     batch_temp.CANCEL_TASKS[user_id] = True
     batch_temp.IS_BATCH[user_id] = True
     
+    # Cancel active download task if exists
+    if user_id in batch_temp.DOWNLOAD_TASKS:
+        try:
+            batch_temp.DOWNLOAD_TASKS[user_id].cancel()
+        except:
+            pass
+    
     await client.send_message(
         chat_id=message.chat.id, 
         text="**🛑 CANCELLING ALL PROCESSES IMMEDIATELY!**\n\n"
              "⚠️ Stopping current download/upload...\n"
              "⚠️ Cleaning up temporary files...\n"
-             "⚠️ Session will be put to sleep...\n"
-             "⚠️ Process will stop within seconds.",
+             "⚠️ Session will be put to sleep...",
         reply_to_message_id=message.id
     )
     
+    # Force stop session immediately
     await stop_user_session(user_id)
 
 
@@ -532,23 +629,14 @@ async def save(client: Client, message: Message):
 
         try:
             for msgid in range(fromID, toID + 1):
-                if batch_temp.CANCEL_TASKS.get(user_id, False) or batch_temp.IS_BATCH.get(user_id, True):
-                    await client.send_message(
-                        message.chat.id,
-                        f"**🛑 Batch Process Cancelled!**\n\n"
-                        f"✅ Completed: {completed}/{total_items} items\n"
-                        f"❌ Cancelled at: {msgid}/{toID}\n"
-                        f"💤 Session going to sleep...",
-                        reply_to_message_id=message.id
-                    )
-                    break
-
+                # Check cancel flag at start of each iteration
                 if batch_temp.CANCEL_TASKS.get(user_id, False):
                     await client.send_message(
                         message.chat.id,
                         f"**🛑 Batch Process Cancelled!**\n\n"
                         f"✅ Completed: {completed}/{total_items} items\n"
-                        f"💤 Session going to sleep...",
+                        f"❌ Cancelled at: {msgid}/{toID}\n"
+                        f"💤 Session terminated.",
                         reply_to_message_id=message.id
                     )
                     break
@@ -560,6 +648,8 @@ async def save(client: Client, message: Message):
                         if success:
                             completed += 1
                     except Exception as e:
+                        if "Cancelled by user" in str(e):
+                            break
                         if ERROR_MESSAGE:
                             await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
@@ -570,6 +660,8 @@ async def save(client: Client, message: Message):
                         if success:
                             completed += 1
                     except Exception as e:
+                        if "Cancelled by user" in str(e):
+                            break
                         if ERROR_MESSAGE:
                             await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
@@ -594,23 +686,36 @@ async def save(client: Client, message: Message):
                             if success:
                                 completed += 1
                         except Exception as e:
+                            if "Cancelled by user" in str(e):
+                                break
                             if ERROR_MESSAGE:
                                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
 
+                # Check cancel again before sleep
                 if batch_temp.CANCEL_TASKS.get(user_id, False):
                     await client.send_message(
                         message.chat.id,
                         f"**🛑 Batch Process Cancelled!**\n\n"
                         f"✅ Completed: {completed}/{total_items} items\n"
-                        f"💤 Session going to sleep...",
+                        f"💤 Session terminated.",
                         reply_to_message_id=message.id
                     )
                     break
 
                 if msgid < toID:
-                    await smart_sleep(user_id)
+                    try:
+                        await smart_sleep(user_id)
+                    except Exception as e:
+                        if "Cancelled by user" in str(e):
+                            await client.send_message(
+                                message.chat.id,
+                                f"**🛑 Process Cancelled During Sleep!**\n\n"
+                                f"✅ Completed: {completed}/{total_items} items",
+                                reply_to_message_id=message.id
+                            )
+                            break
                     
-                if completed % 5 == 0 and completed < total_items:
+                if completed % 5 == 0 and completed < total_items and completed > 0:
                     try:
                         await client.send_message(
                             message.chat.id,
@@ -620,18 +725,26 @@ async def save(client: Client, message: Message):
                     except:
                         pass
 
+        except Exception as e:
+            if "Cancelled by user" not in str(e):
+                print(f"Error in batch process: {e}")
         finally:
             batch_temp.IS_BATCH[user_id] = True
             batch_temp.CANCEL_TASKS[user_id] = False
             
+            # Clean up download task reference
+            if user_id in batch_temp.DOWNLOAD_TASKS:
+                del batch_temp.DOWNLOAD_TASKS[user_id]
+            
+            # Force stop session
             await stop_user_session(user_id)
             
-            if completed > 0:
+            if completed > 0 and not batch_temp.CANCEL_TASKS.get(user_id, False):
                 await client.send_message(
                     message.chat.id,
                     f"✅ **Batch Complete!**\n\n"
                     f"Processed: {completed}/{total_items} items\n"
-                    f"💤 Session put to sleep - will wake up on next task",
+                    f"💤 Session terminated - will restart on next task",
                     reply_to_message_id=message.id
                 )
 
@@ -639,8 +752,9 @@ async def save(client: Client, message: Message):
 async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
     user_id = message.from_user.id
     
+    # Early cancel check
     if batch_temp.CANCEL_TASKS.get(user_id, False):
-        return False
+        raise Exception("Cancelled by user")
     
     msg: Message = await acc.get_messages(chatid, msgid)
     if msg.empty:
@@ -652,8 +766,9 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
     chat = message.chat.id
     
+    # Check cancel again
     if batch_temp.CANCEL_TASKS.get(user_id, False):
-        return False
+        raise Exception("Cancelled by user")
 
     if msg_type == "Text":
         try:
@@ -677,31 +792,52 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
 
     smsg = await client.send_message(message.chat.id, "**📥 Downloading...**", reply_to_message_id=message.id)
     
+    # Store progress message for potential cleanup
+    batch_temp.PROGRESS_MESSAGES[user_id] = smsg.id
+    
     file = None
     start_time = time.time()
     
     try:
+        # Final cancel check before download
         if batch_temp.CANCEL_TASKS.get(user_id, False):
             try:
                 await smsg.delete()
             except:
                 pass
-            return False
+            raise Exception("Cancelled by user")
         
-        file = await acc.download_media(
-            msg, 
-            progress=progress_callback,
-            progress_args=(smsg, "download", start_time)
+        # Create download task and store reference for cancellation
+        download_task = asyncio.create_task(
+            acc.download_media(
+                msg, 
+                progress=progress_callback,
+                progress_args=(smsg, "download", start_time)
+            )
         )
+        batch_temp.DOWNLOAD_TASKS[user_id] = download_task
         
+        # Wait for download with cancel checking
+        try:
+            file = await download_task
+        except asyncio.CancelledError:
+            raise Exception("Cancelled by user")
+        finally:
+            if user_id in batch_temp.DOWNLOAD_TASKS:
+                del batch_temp.DOWNLOAD_TASKS[user_id]
+        
+        # Check cancel after download
         if batch_temp.CANCEL_TASKS.get(user_id, False):
             if file and os.path.exists(file):
-                os.remove(file)
+                try:
+                    os.remove(file)
+                except:
+                    pass
             try:
                 await smsg.delete()
             except:
                 pass
-            return False
+            raise Exception("Cancelled by user")
         
         if file and os.path.exists(file):
             dir_name = os.path.dirname(file)
@@ -716,11 +852,33 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 os.rename(file, new_file_path)
                 file = new_file_path
             
+            # Check cancel before metadata processing
+            if batch_temp.CANCEL_TASKS.get(user_id, False):
+                if file and os.path.exists(file):
+                    try:
+                        os.remove(file)
+                    except:
+                        pass
+                try:
+                    await smsg.delete()
+                except:
+                    pass
+                raise Exception("Cancelled by user")
+            
             file, metadata_added = await add_metadata_with_ffmpeg(file, final_filename)
         
     except Exception as e:
         if file and os.path.exists(file):
-            os.remove(file)
+            try:
+                os.remove(file)
+            except:
+                pass
+        if "Cancelled by user" in str(e):
+            try:
+                await smsg.delete()
+            except:
+                pass
+            raise
         if ERROR_MESSAGE:
             await client.send_message(
                 message.chat.id,
@@ -734,14 +892,18 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             pass
         return False
 
+    # Check cancel before upload
     if batch_temp.CANCEL_TASKS.get(user_id, False):
         if file and os.path.exists(file):
-            os.remove(file)
+            try:
+                os.remove(file)
+            except:
+                pass
         try:
             await smsg.delete()
         except:
             pass
-        return False
+        raise Exception("Cancelled by user")
 
     try:
         await smsg.edit("**📤 Uploading...**")
@@ -899,7 +1061,9 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             upload_success = True
 
     except Exception as e:
-        if "Cancelled by user" not in str(e) and ERROR_MESSAGE:
+        if "Cancelled by user" in str(e):
+            raise
+        if ERROR_MESSAGE:
             await client.send_message(
                 message.chat.id, 
                 f"Error: {e}", 
@@ -907,8 +1071,12 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 parse_mode=enums.ParseMode.HTML
             )
 
+    # Cleanup
     if file and os.path.exists(file):
-        os.remove(file)
+        try:
+            os.remove(file)
+        except:
+            pass
     
     if perm_thumb and os.path.exists(perm_thumb):
         try:
@@ -920,6 +1088,10 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         await client.delete_messages(message.chat.id, [smsg.id])
     except:
         pass
+    
+    # Remove from progress messages
+    if user_id in batch_temp.PROGRESS_MESSAGES:
+        del batch_temp.PROGRESS_MESSAGES[user_id]
 
     return upload_success
 
