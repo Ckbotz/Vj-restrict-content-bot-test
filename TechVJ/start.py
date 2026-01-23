@@ -41,11 +41,11 @@ WORDS_TO_REMOVE = [
 ]
 
 # Permanent thumbnail URL (leave empty string "" to disable)
-PERMANENT_THUMBNAIL_URL = "https://i.ibb.co/nqVhZrzT/IMG-20251124-185914-275.jpg"
+PERMANENT_THUMBNAIL_URL = "https://i.ibb.co/tMwpc3TH/IMG-20260123-205422-326.jpg"
 
 # Prefix and Suffix settings
 FILE_PREFIX = os.environ.get("FILE_PREFIX", "").strip() or None
-FILE_SUFFIX = os.environ.get("FILE_SUFFIX", "@DramaShip").strip() or None
+FILE_SUFFIX = os.environ.get("FILE_SUFFIX", "@BLRealm").strip() or None
 
 # Metadata settings
 METADATA_TITLE = os.environ.get("METADATA_TITLE", "{file_name}").strip() or None
