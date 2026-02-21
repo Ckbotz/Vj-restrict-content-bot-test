@@ -76,6 +76,16 @@ class batch_temp(object):
     PROGRESS_MESSAGES = {}  # Store progress message IDs
 
 
+def get_task_key(user_id: int, chat_id: int) -> str:
+    """Generate a unique key combining user_id and chat_id for group support.
+    
+    In private chats, user_id == chat_id so existing behaviour is unchanged.
+    In groups, each (user, group) pair gets its own slot, allowing multiple
+    users in different groups to run tasks independently.
+    """
+    return f"{user_id}:{chat_id}"
+
+
 def clean_filename(filename):
     """Remove unwanted words from filename"""
     if not filename:
@@ -229,19 +239,16 @@ async def add_metadata_with_ffmpeg(input_file, final_filename):
             
             if codec_type == 'video' and METADATA_VIDEO_TITLE:
                 video_title = METADATA_VIDEO_TITLE.format(file_name=final_filename)
-                # Count video streams before this one
                 video_idx = sum(1 for s in streams[:idx] if s.get('codec_type') == 'video')
                 cmd.extend([f'-metadata:s:v:{video_idx}', f'title={video_title}'])
             
             elif codec_type == 'audio' and METADATA_AUDIO_TITLE:
                 audio_title = METADATA_AUDIO_TITLE.format(file_name=final_filename)
-                # Count audio streams before this one
                 audio_idx = sum(1 for s in streams[:idx] if s.get('codec_type') == 'audio')
                 cmd.extend([f'-metadata:s:a:{audio_idx}', f'title={audio_title}'])
             
             elif codec_type == 'subtitle' and METADATA_SUBTITLE_TITLE:
                 subtitle_title = METADATA_SUBTITLE_TITLE.format(file_name=final_filename)
-                # Count subtitle streams before this one
                 subtitle_idx = sum(1 for s in streams[:idx] if s.get('codec_type') == 'subtitle')
                 cmd.extend([f'-metadata:s:s:{subtitle_idx}', f'title={subtitle_title}'])
         
@@ -275,17 +282,22 @@ async def add_metadata_with_ffmpeg(input_file, final_filename):
         return input_file, False
 
 
-async def smart_sleep(user_id):
-    """Intelligent sleep with randomization and cancel check"""
+async def smart_sleep(task_key: str):
+    """Intelligent sleep with randomization and cancel check.
+    
+    task_key is the combined user:chat key returned by get_task_key().
+    Sleep values are stored per-user (first segment of the key) so the same
+    user keeps their preference across groups.
+    """
+    user_id = int(task_key.split(":")[0])
     base_sleep = batch_temp.CUSTOM_SLEEP.get(user_id, [3, 5, 7, 10])
     sleep_time = random.choice(base_sleep)
     jitter = random.uniform(-0.2, 0.2) * sleep_time
     final_sleep = sleep_time + jitter
     
-    # Check every 0.2 seconds for more responsive cancellation
     sleep_chunks = int(final_sleep / 0.2)
     for _ in range(sleep_chunks):
-        if batch_temp.CANCEL_TASKS.get(user_id, False):
+        if batch_temp.CANCEL_TASKS.get(task_key, False):
             raise ProcessCancelled("Process cancelled by user")
         await asyncio.sleep(0.2)
 
@@ -344,7 +356,7 @@ last_edit_time = {}
 spinner_index = {}
 
 
-async def progress_callback(current, total, message, mode, start_time):
+async def progress_callback(current, total, message, mode, start_time, task_key=None):
     """Enhanced progress bar with cancel button and frequent cancel checks"""
     global last_edit_time, spinner_index
 
@@ -357,15 +369,17 @@ async def progress_callback(current, total, message, mode, start_time):
         spinner_index[msg_id] = 0
 
     now = time.time()
-    
-    user_id = getattr(getattr(message, "from_user", None), "id", None)
-    if not user_id:
-        user_id = getattr(message, "chat", None)
-        if user_id:
-            user_id = user_id.id
 
-    # Check for cancellation MORE FREQUENTLY - raise custom exception
-    if user_id and batch_temp.CANCEL_TASKS.get(user_id, False):
+    # Resolve task_key for cancel checking
+    if task_key is None:
+        user_id = getattr(getattr(message, "from_user", None), "id", None)
+        if not user_id:
+            chat = getattr(message, "chat", None)
+            if chat:
+                user_id = chat.id
+        task_key = str(user_id) if user_id else None
+
+    if task_key and batch_temp.CANCEL_TASKS.get(task_key, False):
         raise ProcessCancelled("Process cancelled by user")
 
     if msg_id in last_edit_time:
@@ -396,9 +410,9 @@ async def progress_callback(current, total, message, mode, start_time):
         f"**ETA:** {format_time(eta)}"
     )
 
-    # Add cancel button
+    # Encode task_key safely into callback_data
     cancel_button = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛑 Cancel Process", callback_data=f"cancel_{user_id}")]
+        [InlineKeyboardButton("🛑 Cancel Process", callback_data=f"cancel_{task_key}")]
     ])
 
     try:
@@ -408,21 +422,34 @@ async def progress_callback(current, total, message, mode, start_time):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Cancel callback – supports both private (legacy "cancel_<user_id>") and
+# group ("cancel_<user_id>:<chat_id>") callback data formats.
+# ---------------------------------------------------------------------------
 @Client.on_callback_query(filters.regex(r"^cancel_"))
 async def cancel_callback(client: Client, callback_query: CallbackQuery):
     """Handle cancel button press"""
-    data = callback_query.data
-    user_id = int(data.split("_")[1])
-    
+    data = callback_query.data  # e.g. "cancel_123456789" or "cancel_123456789:987654321"
+    payload = data[len("cancel_"):]  # strip prefix
+
+    # Determine user_id and task_key from payload
+    if ":" in payload:
+        parts = payload.split(":", 1)
+        user_id = int(parts[0])
+        task_key = payload  # "user_id:chat_id"
+    else:
+        user_id = int(payload)
+        task_key = payload  # legacy private-chat format
+
     if callback_query.from_user.id != user_id:
         await callback_query.answer("⚠️ This is not your process!", show_alert=True)
         return
-    
-    batch_temp.CANCEL_TASKS[user_id] = True
-    batch_temp.IS_BATCH[user_id] = True
-    
+
+    batch_temp.CANCEL_TASKS[task_key] = True
+    batch_temp.IS_BATCH[task_key] = True
+
     await callback_query.answer("🛑 Cancelling process...", show_alert=True)
-    
+
     try:
         await callback_query.message.edit_text(
             "**🛑 CANCELLATION IN PROGRESS**\n\n"
@@ -434,7 +461,10 @@ async def cancel_callback(client: Client, callback_query: CallbackQuery):
         pass
 
 
-@Client.on_message(filters.command(["start"]))
+# ---------------------------------------------------------------------------
+# /start  (private only)
+# ---------------------------------------------------------------------------
+@Client.on_message(filters.command(["start"]) & filters.private)
 async def send_start(client: Client, message: Message):
     if not await db.is_user_exist(message.from_user.id):
         await db.add_user(message.from_user.id, message.from_user.first_name)
@@ -461,27 +491,40 @@ async def send_start(client: Client, message: Message):
     )
 
 
-@Client.on_message(filters.command(["help"]))
+# ---------------------------------------------------------------------------
+# /help  (private + group)
+# ---------------------------------------------------------------------------
+@Client.on_message(filters.command(["help"]) & (filters.private | filters.group))
 async def send_help(client: Client, message: Message):
-    help_text = f"{HELP_TXT}\n\n**🕐 Custom Sleep Settings:**\n" \
-                f"Use `/setsleep` command to set custom delays between batch downloads.\n" \
-                f"Example: `/setsleep 3 5 7 10` (bot will randomly pick from these values)\n\n" \
-                f"Use `/getsleep` to see your current sleep settings.\n\n" \
-                f"**🛑 Cancel Command:**\n" \
-                f"Use `/cancel` to immediately stop any ongoing batch process.\n" \
-                f"You can also click the 'Cancel' button during download/upload.\n\n" \
-                f"**💤 Session Management:**\n" \
-                f"Your session automatically goes to sleep after task completion to save resources.\n\n" \
-                f"**📝 File Customization:**\n" \
-                f"• Files are auto-cleaned (removes keywords)\n" \
-                f"• Prefix/Suffix added automatically\n" \
-                f"• Metadata embedded in videos/audio\n" \
-                f"• Stream titles (video/audio/subtitle) added\n" \
-                f"• All subtitles & audio tracks preserved"
+    help_text = (
+        f"{HELP_TXT}\n\n"
+        f"**🕐 Custom Sleep Settings:**\n"
+        f"Use `/setsleep` command to set custom delays between batch downloads.\n"
+        f"Example: `/setsleep 3 5 7 10` (bot will randomly pick from these values)\n\n"
+        f"Use `/getsleep` to see your current sleep settings.\n\n"
+        f"**🛑 Cancel Command:**\n"
+        f"Use `/cancel` to immediately stop any ongoing batch process.\n"
+        f"You can also click the 'Cancel' button during download/upload.\n\n"
+        f"**💤 Session Management:**\n"
+        f"Your session automatically goes to sleep after task completion to save resources.\n\n"
+        f"**📝 File Customization:**\n"
+        f"• Files are auto-cleaned (removes keywords)\n"
+        f"• Prefix/Suffix added automatically\n"
+        f"• Metadata embedded in videos/audio\n"
+        f"• Stream titles (video/audio/subtitle) added\n"
+        f"• All subtitles & audio tracks preserved\n\n"
+        f"**👥 Group Support:**\n"
+        f"Send a Telegram link (single or batch) directly in any group where the bot is a member.\n"
+        f"The bot will download and upload the content right into that group.\n"
+        f"`/setsleep` and `/cancel` work in groups too!"
+    )
     await client.send_message(chat_id=message.chat.id, text=help_text)
 
 
-@Client.on_message(filters.command(["setsleep"]))
+# ---------------------------------------------------------------------------
+# /setsleep  (private + group)
+# ---------------------------------------------------------------------------
+@Client.on_message(filters.command(["setsleep"]) & (filters.private | filters.group))
 async def set_sleep(client: Client, message: Message):
     try:
         parts = message.text.split()[1:]
@@ -501,6 +544,7 @@ async def set_sleep(client: Client, message: Message):
             await message.reply("❌ Please provide valid sleep values between 1-1000 seconds!")
             return
         
+        # Sleep settings are stored per-user (consistent across all chats)
         batch_temp.CUSTOM_SLEEP[message.from_user.id] = sleep_values
         await message.reply(
             f"✅ **Sleep values set successfully!**\n\n"
@@ -512,7 +556,10 @@ async def set_sleep(client: Client, message: Message):
         await message.reply("❌ Please provide valid numeric values only!")
 
 
-@Client.on_message(filters.command(["getsleep"]))
+# ---------------------------------------------------------------------------
+# /getsleep  (private + group)
+# ---------------------------------------------------------------------------
+@Client.on_message(filters.command(["getsleep"]) & (filters.private | filters.group))
 async def get_sleep(client: Client, message: Message):
     sleep_values = batch_temp.CUSTOM_SLEEP.get(message.from_user.id, [3, 5, 7, 10])
     await message.reply(
@@ -523,44 +570,56 @@ async def get_sleep(client: Client, message: Message):
     )
 
 
-@Client.on_message(filters.command(["cancel"]))
+# ---------------------------------------------------------------------------
+# /cancel  (private + group)
+# ---------------------------------------------------------------------------
+@Client.on_message(filters.command(["cancel"]) & (filters.private | filters.group))
 async def send_cancel(client: Client, message: Message):
     user_id = message.from_user.id
-    
-    if user_id not in batch_temp.IS_BATCH or batch_temp.IS_BATCH.get(user_id, True) is True:
+    chat_id = message.chat.id
+    task_key = get_task_key(user_id, chat_id)
+
+    if batch_temp.IS_BATCH.get(task_key, True) is True:
         await client.send_message(
-            chat_id=message.chat.id, 
+            chat_id=message.chat.id,
             text="**❌ No Active Batch Process To Cancel.**",
             reply_to_message_id=message.id
         )
         return
-    
-    batch_temp.CANCEL_TASKS[user_id] = True
-    batch_temp.IS_BATCH[user_id] = True
-    
+
+    batch_temp.CANCEL_TASKS[task_key] = True
+    batch_temp.IS_BATCH[task_key] = True
+
     # Cancel active download task if exists
-    if user_id in batch_temp.DOWNLOAD_TASKS:
+    if task_key in batch_temp.DOWNLOAD_TASKS:
         try:
-            batch_temp.DOWNLOAD_TASKS[user_id].cancel()
+            batch_temp.DOWNLOAD_TASKS[task_key].cancel()
         except:
             pass
-    
+
     await client.send_message(
-        chat_id=message.chat.id, 
+        chat_id=message.chat.id,
         text="**🛑 CANCELLING ALL PROCESSES IMMEDIATELY!**\n\n"
              "⚠️ Stopping current download/upload...\n"
              "⚠️ Cleaning up temporary files...\n"
              "⚠️ Session will be terminated...",
         reply_to_message_id=message.id
     )
-    
-    # Force stop session immediately
+
     await stop_user_session(user_id)
 
 
-@Client.on_message(filters.text & filters.private)
+# ---------------------------------------------------------------------------
+# Main message handler – private chats AND groups
+# ---------------------------------------------------------------------------
+@Client.on_message(filters.text & (filters.private | filters.group))
 async def save(client: Client, message: Message):
+    # ------------------------------------------------------------------
+    # Invite-link handling (private only, unchanged behaviour)
+    # ------------------------------------------------------------------
     if ("https://t.me/+" in message.text or "https://t.me/joinchat/" in message.text) and LOGIN_SYSTEM is False:
+        if not filters.private(None, message):  # skip in groups
+            return
         if TechVJUser is None:
             await client.send_message(
                 message.chat.id,
@@ -602,172 +661,183 @@ async def save(client: Client, message: Message):
 
         return
 
-    if "https://t.me/" in message.text:
-        user_id = message.from_user.id
-        
-        if batch_temp.IS_BATCH.get(user_id) is False:
-            return await message.reply_text(
-                "**⚠️ One Task Is Already Processing!**\n\n"
-                "Please wait for it to complete or use /cancel to stop it."
-            )
+    # ------------------------------------------------------------------
+    # Telegram post-link handling (private + group)
+    # ------------------------------------------------------------------
+    if "https://t.me/" not in message.text:
+        return
 
-        datas = message.text.split("/")
-        temp = datas[-1].replace("?single", "").split("-")
-        fromID = int(temp[0].strip())
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    task_key = get_task_key(user_id, chat_id)
 
-        try:
-            toID = int(temp[1].strip())
-        except:
-            toID = fromID
+    if batch_temp.IS_BATCH.get(task_key) is False:
+        return await message.reply_text(
+            "**⚠️ One Task Is Already Processing!**\n\n"
+            "Please wait for it to complete or use /cancel to stop it."
+        )
 
-        batch_temp.CANCEL_TASKS[user_id] = False
-        batch_temp.IS_BATCH[user_id] = False
-        
-        total_items = toID - fromID + 1
-        completed = 0
+    datas = message.text.split("/")
+    temp = datas[-1].replace("?single", "").split("-")
+    fromID = int(temp[0].strip())
 
-        acc, error_msg = await get_user_session(user_id)
-        if acc is None:
-            await message.reply(error_msg)
-            batch_temp.IS_BATCH[user_id] = True
-            batch_temp.CANCEL_TASKS[user_id] = False
-            return
+    try:
+        toID = int(temp[1].strip())
+    except:
+        toID = fromID
 
-        try:
-            for msgid in range(fromID, toID + 1):
-                # Check cancel flag at start of each iteration
-                if batch_temp.CANCEL_TASKS.get(user_id, False):
-                    await client.send_message(
-                        message.chat.id,
-                        f"**🛑 Batch Process Cancelled!**\n\n"
-                        f"✅ Completed: {completed}/{total_items} items\n"
-                        f"❌ Cancelled at: {msgid}/{toID}\n"
-                        f"💤 Session terminated.",
-                        reply_to_message_id=message.id
-                    )
-                    break
+    batch_temp.CANCEL_TASKS[task_key] = False
+    batch_temp.IS_BATCH[task_key] = False
 
-                if "https://t.me/c/" in message.text:
-                    chatid = int("-100" + datas[4])
-                    try:
-                        success = await handle_private(client, acc, message, chatid, msgid)
-                        if success:
-                            completed += 1
-                    except ProcessCancelled:
-                        break
-                    except Exception as e:
-                        if ERROR_MESSAGE:
-                            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+    total_items = toID - fromID + 1
+    completed = 0
 
-                elif "https://t.me/b/" in message.text:
-                    username = datas[4]
-                    try:
-                        success = await handle_private(client, acc, message, username, msgid)
-                        if success:
-                            completed += 1
-                    except ProcessCancelled:
-                        break
-                    except Exception as e:
-                        if ERROR_MESSAGE:
-                            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+    acc, error_msg = await get_user_session(user_id)
+    if acc is None:
+        await message.reply(error_msg)
+        batch_temp.IS_BATCH[task_key] = True
+        batch_temp.CANCEL_TASKS[task_key] = False
+        return
 
-                else:
-                    username = datas[3]
-                    try:
-                        msg = await client.get_messages(username, msgid)
-                    except UsernameNotOccupied:
-                        await client.send_message(
-                            message.chat.id,
-                            "The username is not occupied by anyone",
-                            reply_to_message_id=message.id,
-                        )
-                        break
-
-                    try:
-                        await client.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
-                        completed += 1
-                    except:
-                        try:
-                            success = await handle_private(client, acc, message, username, msgid)
-                            if success:
-                                completed += 1
-                        except ProcessCancelled:
-                            break
-                        except Exception as e:
-                            if ERROR_MESSAGE:
-                                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-
-                # Check cancel again before sleep
-                if batch_temp.CANCEL_TASKS.get(user_id, False):
-                    await client.send_message(
-                        message.chat.id,
-                        f"**🛑 Batch Process Cancelled!**\n\n"
-                        f"✅ Completed: {completed}/{total_items} items\n"
-                        f"💤 Session terminated.",
-                        reply_to_message_id=message.id
-                    )
-                    break
-
-                if msgid < toID:
-                    try:
-                        await smart_sleep(user_id)
-                    except ProcessCancelled:
-                        await client.send_message(
-                            message.chat.id,
-                            f"**🛑 Process Cancelled During Sleep!**\n\n"
-                            f"✅ Completed: {completed}/{total_items} items",
-                            reply_to_message_id=message.id
-                        )
-                        break
-                    
-                if completed % 5 == 0 and completed < total_items and completed > 0:
-                    try:
-                        await client.send_message(
-                            message.chat.id,
-                            f"📊 Progress: {completed}/{total_items} completed...",
-                            reply_to_message_id=message.id
-                        )
-                    except:
-                        pass
-
-        except ProcessCancelled:
-            await client.send_message(
-                message.chat.id,
-                f"**🛑 Batch Process Cancelled!**\n\n"
-                f"✅ Completed: {completed}/{total_items} items\n"
-                f"💤 Session terminated.",
-                reply_to_message_id=message.id
-            )
-        except Exception as e:
-            print(f"Error in batch process: {e}")
-        finally:
-            batch_temp.IS_BATCH[user_id] = True
-            batch_temp.CANCEL_TASKS[user_id] = False
-            
-            # Clean up download task reference
-            if user_id in batch_temp.DOWNLOAD_TASKS:
-                del batch_temp.DOWNLOAD_TASKS[user_id]
-            
-            # Force stop session
-            await stop_user_session(user_id)
-            
-            if completed > 0 and not batch_temp.CANCEL_TASKS.get(user_id, False):
+    try:
+        for msgid in range(fromID, toID + 1):
+            # Check cancel flag at start of each iteration
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
                 await client.send_message(
                     message.chat.id,
-                    f"✅ **Batch Complete!**\n\n"
-                    f"Processed: {completed}/{total_items} items\n"
-                    f"💤 Session terminated - will restart on next task",
+                    f"**🛑 Batch Process Cancelled!**\n\n"
+                    f"✅ Completed: {completed}/{total_items} items\n"
+                    f"❌ Cancelled at: {msgid}/{toID}\n"
+                    f"💤 Session terminated.",
                     reply_to_message_id=message.id
                 )
+                break
+
+            if "https://t.me/c/" in message.text:
+                chatid = int("-100" + datas[4])
+                try:
+                    success = await handle_private(client, acc, message, chatid, msgid, task_key)
+                    if success:
+                        completed += 1
+                except ProcessCancelled:
+                    break
+                except Exception as e:
+                    if ERROR_MESSAGE:
+                        await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+
+            elif "https://t.me/b/" in message.text:
+                username = datas[4]
+                try:
+                    success = await handle_private(client, acc, message, username, msgid, task_key)
+                    if success:
+                        completed += 1
+                except ProcessCancelled:
+                    break
+                except Exception as e:
+                    if ERROR_MESSAGE:
+                        await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+
+            else:
+                username = datas[3]
+                try:
+                    msg = await client.get_messages(username, msgid)
+                except UsernameNotOccupied:
+                    await client.send_message(
+                        message.chat.id,
+                        "The username is not occupied by anyone",
+                        reply_to_message_id=message.id,
+                    )
+                    break
+
+                try:
+                    await client.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+                    completed += 1
+                except:
+                    try:
+                        success = await handle_private(client, acc, message, username, msgid, task_key)
+                        if success:
+                            completed += 1
+                    except ProcessCancelled:
+                        break
+                    except Exception as e:
+                        if ERROR_MESSAGE:
+                            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+
+            # Check cancel again before sleep
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
+                await client.send_message(
+                    message.chat.id,
+                    f"**🛑 Batch Process Cancelled!**\n\n"
+                    f"✅ Completed: {completed}/{total_items} items\n"
+                    f"💤 Session terminated.",
+                    reply_to_message_id=message.id
+                )
+                break
+
+            if msgid < toID:
+                try:
+                    await smart_sleep(task_key)
+                except ProcessCancelled:
+                    await client.send_message(
+                        message.chat.id,
+                        f"**🛑 Process Cancelled During Sleep!**\n\n"
+                        f"✅ Completed: {completed}/{total_items} items",
+                        reply_to_message_id=message.id
+                    )
+                    break
+
+            if completed % 5 == 0 and completed < total_items and completed > 0:
+                try:
+                    await client.send_message(
+                        message.chat.id,
+                        f"📊 Progress: {completed}/{total_items} completed...",
+                        reply_to_message_id=message.id
+                    )
+                except:
+                    pass
+
+    except ProcessCancelled:
+        await client.send_message(
+            message.chat.id,
+            f"**🛑 Batch Process Cancelled!**\n\n"
+            f"✅ Completed: {completed}/{total_items} items\n"
+            f"💤 Session terminated.",
+            reply_to_message_id=message.id
+        )
+    except Exception as e:
+        print(f"Error in batch process: {e}")
+    finally:
+        batch_temp.IS_BATCH[task_key] = True
+        batch_temp.CANCEL_TASKS[task_key] = False
+
+        if task_key in batch_temp.DOWNLOAD_TASKS:
+            del batch_temp.DOWNLOAD_TASKS[task_key]
+
+        await stop_user_session(user_id)
+
+        if completed > 0 and not batch_temp.CANCEL_TASKS.get(task_key, False):
+            await client.send_message(
+                message.chat.id,
+                f"✅ **Batch Complete!**\n\n"
+                f"Processed: {completed}/{total_items} items\n"
+                f"💤 Session terminated - will restart on next task",
+                reply_to_message_id=message.id
+            )
 
 
-async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
+# ---------------------------------------------------------------------------
+# handle_private – now accepts task_key for group-aware cancel tracking
+# ---------------------------------------------------------------------------
+async def handle_private(client: Client, acc, message: Message, chatid, msgid: int, task_key: str = None):
     user_id = message.from_user.id
-    
-    # Early cancel check
-    if batch_temp.CANCEL_TASKS.get(user_id, False):
+
+    # Derive task_key from message if not provided (backward-compat)
+    if task_key is None:
+        task_key = get_task_key(user_id, message.chat.id)
+
+    if batch_temp.CANCEL_TASKS.get(task_key, False):
         raise ProcessCancelled("Process cancelled by user")
-    
+
     msg: Message = await acc.get_messages(chatid, msgid)
     if msg.empty:
         return False
@@ -777,9 +847,8 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         return False
 
     chat = message.chat.id
-    
-    # Check cancel again
-    if batch_temp.CANCEL_TASKS.get(user_id, False):
+
+    if batch_temp.CANCEL_TASKS.get(task_key, False):
         raise ProcessCancelled("Process cancelled by user")
 
     if msg_type == "Text":
@@ -803,43 +872,38 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             return False
 
     smsg = await client.send_message(message.chat.id, "**📥 Downloading...**", reply_to_message_id=message.id)
-    
-    # Store progress message for potential cleanup
-    batch_temp.PROGRESS_MESSAGES[user_id] = smsg.id
-    
+
+    batch_temp.PROGRESS_MESSAGES[task_key] = smsg.id
+
     file = None
     start_time = time.time()
-    
+
     try:
-        # Final cancel check before download
-        if batch_temp.CANCEL_TASKS.get(user_id, False):
+        if batch_temp.CANCEL_TASKS.get(task_key, False):
             try:
                 await smsg.delete()
             except:
                 pass
             raise ProcessCancelled("Process cancelled by user")
-        
-        # Create download task and store reference for cancellation
+
         download_task = asyncio.create_task(
             acc.download_media(
-                msg, 
+                msg,
                 progress=progress_callback,
-                progress_args=(smsg, "download", start_time)
+                progress_args=(smsg, "download", start_time, task_key)
             )
         )
-        batch_temp.DOWNLOAD_TASKS[user_id] = download_task
-        
-        # Wait for download with cancel checking
+        batch_temp.DOWNLOAD_TASKS[task_key] = download_task
+
         try:
             file = await download_task
         except asyncio.CancelledError:
             raise ProcessCancelled("Process cancelled by user")
         finally:
-            if user_id in batch_temp.DOWNLOAD_TASKS:
-                del batch_temp.DOWNLOAD_TASKS[user_id]
-        
-        # Check cancel after download
-        if batch_temp.CANCEL_TASKS.get(user_id, False):
+            if task_key in batch_temp.DOWNLOAD_TASKS:
+                del batch_temp.DOWNLOAD_TASKS[task_key]
+
+        if batch_temp.CANCEL_TASKS.get(task_key, False):
             if file and os.path.exists(file):
                 try:
                     os.remove(file)
@@ -850,22 +914,21 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             except:
                 pass
             raise ProcessCancelled("Process cancelled by user")
-        
+
         if file and os.path.exists(file):
             dir_name = os.path.dirname(file)
             old_filename = os.path.basename(file)
-            
+
             cleaned_filename = clean_filename(old_filename)
             final_filename = apply_prefix_suffix(cleaned_filename)
-            
+
             new_file_path = os.path.join(dir_name, final_filename)
-            
+
             if old_filename != final_filename:
                 os.rename(file, new_file_path)
                 file = new_file_path
-            
-            # Check cancel before metadata processing
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
+
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
                 if file and os.path.exists(file):
                     try:
                         os.remove(file)
@@ -876,9 +939,9 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 except:
                     pass
                 raise ProcessCancelled("Process cancelled by user")
-            
+
             file, metadata_added = await add_metadata_with_ffmpeg(file, final_filename)
-        
+
     except ProcessCancelled:
         if file and os.path.exists(file):
             try:
@@ -909,8 +972,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             pass
         return False
 
-    # Check cancel before upload
-    if batch_temp.CANCEL_TASKS.get(user_id, False):
+    if batch_temp.CANCEL_TASKS.get(task_key, False):
         if file and os.path.exists(file):
             try:
                 os.remove(file)
@@ -926,21 +988,21 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
         await smsg.edit("**📤 Uploading...**")
     except:
         pass
-    
+
     caption = msg.caption if msg.caption else None
     upload_success = False
-    
+
     perm_thumb = None
     if PERMANENT_THUMBNAIL_URL:
         perm_thumb = await download_thumbnail(client, PERMANENT_THUMBNAIL_URL)
 
     start_time = time.time()
-    
+
     try:
         if msg_type == "Document":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
                 raise ProcessCancelled("Process cancelled by user")
-            
+
             if perm_thumb:
                 ph_path = perm_thumb
             else:
@@ -948,7 +1010,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                     ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
                 except:
                     ph_path = None
-            
+
             await client.send_document(
                 chat,
                 file,
@@ -958,17 +1020,17 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
                 progress=progress_callback,
-                progress_args=(smsg, "upload", start_time),
+                progress_args=(smsg, "upload", start_time, task_key),
             )
             upload_success = True
-            
+
             if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
                 os.remove(ph_path)
 
         elif msg_type == "Video":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
                 raise ProcessCancelled("Process cancelled by user")
-            
+
             if perm_thumb:
                 ph_path = perm_thumb
             else:
@@ -976,7 +1038,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                     ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
                 except:
                     ph_path = None
-            
+
             await client.send_video(
                 chat,
                 file,
@@ -989,41 +1051,41 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
                 progress=progress_callback,
-                progress_args=(smsg, "upload", start_time),
+                progress_args=(smsg, "upload", start_time, task_key),
             )
             upload_success = True
-            
+
             if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
                 os.remove(ph_path)
 
         elif msg_type == "Animation":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
                 raise ProcessCancelled("Process cancelled by user")
-            
+
             await client.send_animation(
-                chat, 
-                file, 
-                reply_to_message_id=message.id, 
+                chat,
+                file,
+                reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML
             )
             upload_success = True
 
         elif msg_type == "Sticker":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
                 raise ProcessCancelled("Process cancelled by user")
-            
+
             await client.send_sticker(
-                chat, 
-                file, 
-                reply_to_message_id=message.id, 
+                chat,
+                file,
+                reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML
             )
             upload_success = True
 
         elif msg_type == "Voice":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
                 raise ProcessCancelled("Process cancelled by user")
-            
+
             await client.send_voice(
                 chat,
                 file,
@@ -1032,14 +1094,14 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
                 progress=progress_callback,
-                progress_args=(smsg, "upload", start_time),
+                progress_args=(smsg, "upload", start_time, task_key),
             )
             upload_success = True
 
         elif msg_type == "Audio":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
                 raise ProcessCancelled("Process cancelled by user")
-            
+
             if perm_thumb:
                 ph_path = perm_thumb
             else:
@@ -1047,7 +1109,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                     ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
                 except:
                     ph_path = None
-            
+
             await client.send_audio(
                 chat,
                 file,
@@ -1057,22 +1119,22 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML,
                 progress=progress_callback,
-                progress_args=(smsg, "upload", start_time),
+                progress_args=(smsg, "upload", start_time, task_key),
             )
             upload_success = True
-            
+
             if ph_path and ph_path != perm_thumb and os.path.exists(ph_path):
                 os.remove(ph_path)
 
         elif msg_type == "Photo":
-            if batch_temp.CANCEL_TASKS.get(user_id, False):
+            if batch_temp.CANCEL_TASKS.get(task_key, False):
                 raise ProcessCancelled("Process cancelled by user")
-            
+
             await client.send_photo(
-                chat, 
-                file, 
-                caption=caption, 
-                reply_to_message_id=message.id, 
+                chat,
+                file,
+                caption=caption,
+                reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML
             )
             upload_success = True
@@ -1082,9 +1144,9 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
     except Exception as e:
         if ERROR_MESSAGE:
             await client.send_message(
-                message.chat.id, 
-                f"Error: {e}", 
-                reply_to_message_id=message.id, 
+                message.chat.id,
+                f"Error: {e}",
+                reply_to_message_id=message.id,
                 parse_mode=enums.ParseMode.HTML
             )
 
@@ -1094,21 +1156,20 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             os.remove(file)
         except:
             pass
-    
+
     if perm_thumb and os.path.exists(perm_thumb):
         try:
             os.remove(perm_thumb)
         except:
             pass
-    
+
     try:
         await client.delete_messages(message.chat.id, [smsg.id])
     except:
         pass
-    
-    # Remove from progress messages
-    if user_id in batch_temp.PROGRESS_MESSAGES:
-        del batch_temp.PROGRESS_MESSAGES[user_id]
+
+    if task_key in batch_temp.PROGRESS_MESSAGES:
+        del batch_temp.PROGRESS_MESSAGES[task_key]
 
     return upload_success
 
