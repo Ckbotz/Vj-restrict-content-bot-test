@@ -41,7 +41,7 @@ WORDS_TO_REMOVE = [
 ]
 
 # Permanent thumbnail URL (leave empty string "" to disable)
-PERMANENT_THUMBNAIL_URL = "https://i.ibb.co/tMwpc3TH/IMG-20260123-205422-326.jpg"
+PERMANENT_THUMBNAIL_URL = "https://vault.pictures/media/images/4e/6b/28/4e6b28bc677040089c72a5c1a1b00ee1.jpg"
 
 # Prefix and Suffix settings
 FILE_PREFIX = os.environ.get("FILE_PREFIX", "").strip() or None
