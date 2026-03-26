@@ -41,7 +41,7 @@ WORDS_TO_REMOVE = [
 ]
 
 # Permanent thumbnail URL (leave empty string "" to disable)
-PERMANENT_THUMBNAIL_URL = "https://vault.pictures/media/images/4e/6b/28/4e6b28bc677040089c72a5c1a1b00ee1.jpg"
+PERMANENT_THUMBNAIL_URL = "https://vault.pictures/media/images/78/8e/d3/788ed3debf9244a49d71bbf8b2e45d22.jpg"
 
 # Prefix and Suffix settings
 FILE_PREFIX = os.environ.get("FILE_PREFIX", "").strip() or None
@@ -57,7 +57,7 @@ METADATA_COMMENT = os.environ.get("METADATA_COMMENT", "@DramaShip").strip() or N
 # Video/Audio/Subtitle Stream Title settings
 METADATA_VIDEO_TITLE = os.environ.get("METADATA_VIDEO_TITLE", "@DramaShip").strip() or None
 METADATA_AUDIO_TITLE = os.environ.get("METADATA_AUDIO_TITLE", "@DramaShip").strip() or None
-METADATA_SUBTITLE_TITLE = os.environ.get("METADATA_SUBTITLE_TITLE", "").strip() or None
+METADATA_SUBTITLE_TITLE = os.environ.get("METADATA_SUBTITLE_TITLE", "@DramaShip").strip() or None
 # =========================================
 
 
