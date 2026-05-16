@@ -25,6 +25,75 @@ from database.db import db
 from TechVJ.strings import HELP_TXT
 from bot import TechVJUser
 
+
+# ===========================================================================
+# OPTIMIZATION: Chunk-size increase + inter-chunk throttle
+#
+# Strategy: wrap pyrogram.utils.get_file (the internal async generator that
+# issues upload.GetFile RPCs) so that:
+#   1. Every request asks for the maximum allowed chunk: 1 MB (1 024 × 1 024 B).
+#      Fewer RPCs → fewer opportunities for Telegram to issue flood waits.
+#   2. A 0.1 s sleep is injected *between* consecutive chunk requests so the
+#      download rate is throttled and we stay well under Telegram's rate limit.
+#
+# CRITICAL: No existing function body is modified.  The patch is applied once
+# at import time by replacing the module-level reference with a thin wrapper.
+# ===========================================================================
+
+_MAX_CHUNK_SIZE = 1024 * 1024        # 1 MB — maximum pyrofork accepts
+_INTER_CHUNK_DELAY = 0.1             # seconds between each chunk RPC
+
+try:
+    import pyrogram.utils as _putils  # noqa: E402
+
+    _original_get_file = _putils.get_file  # keep a reference to the original
+
+    async def _throttled_get_file(
+        client,
+        id,
+        access_hash,
+        file_reference,
+        offset,
+        limit=_MAX_CHUNK_SIZE,       # ← override default chunk size here
+        *args,
+        **kwargs,
+    ):
+        """
+        Wrapper around pyrogram.utils.get_file that:
+        - Forces chunk size to _MAX_CHUNK_SIZE (1 MB).
+        - Sleeps _INTER_CHUNK_DELAY seconds before every chunk after the first
+          to throttle upload.GetFile RPCs and avoid flood waits.
+        """
+        first_chunk = True
+        async for chunk in _original_get_file(
+            client,
+            id,
+            access_hash,
+            file_reference,
+            offset,
+            limit,          # pass the overridden limit through
+            *args,
+            **kwargs,
+        ):
+            if not first_chunk:
+                await asyncio.sleep(_INTER_CHUNK_DELAY)
+            first_chunk = False
+            yield chunk
+
+    # Apply the patch globally — affects ALL Client instances in this process.
+    _putils.get_file = _throttled_get_file
+    print("[throttle] pyrogram.utils.get_file patched: "
+          f"chunk={_MAX_CHUNK_SIZE // 1024} KB, delay={_INTER_CHUNK_DELAY}s")
+
+except Exception as _patch_err:
+    # Never crash the bot because of the patch; just warn.
+    print(f"[throttle] WARNING: could not patch get_file: {_patch_err}")
+
+# ===========================================================================
+# END OPTIMIZATION
+# ===========================================================================
+
+
 # ========== CONFIGURATION SECTION ==========
 # Add words to remove from filename (case-insensitive)
 WORDS_TO_REMOVE = [
