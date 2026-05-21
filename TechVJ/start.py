@@ -41,7 +41,7 @@ from bot import TechVJUser
 # ===========================================================================
 
 _MAX_CHUNK_SIZE = 1024 * 1024        # 1 MB — maximum pyrofork accepts
-_INTER_CHUNK_DELAY = 0.5             # seconds between each chunk RPC
+_INTER_CHUNK_DELAY = 1             # seconds between each chunk RPC
 
 try:
     import pyrogram.utils as _putils  # noqa: E402
