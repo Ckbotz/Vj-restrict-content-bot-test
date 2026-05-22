@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 _MAX_CHUNK_SIZE = 1024 * 1024  # 1 MB
-_INTER_CHUNK_DELAY = 0.5  # Increased from 0.1s to reduce flood waits
+_INTER_CHUNK_DELAY = 0.5
 
 
 def _apply_chunk_size_patch():
@@ -107,16 +107,13 @@ if STRING_SESSION is not None and LOGIN_SYSTEM is False:
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=STRING_SESSION,
-        connection_retries=5,
-        retry_delay=1,
-        timeout=30,
     )
 else:
     TechVJUser = None
 
 
 class Bot(Client):
-    """Main bot client with stability improvements"""
+    """Main bot client"""
 
     def __init__(self):
         super().__init__(
@@ -127,11 +124,6 @@ class Bot(Client):
             plugins=dict(root="TechVJ"),
             workers=25,
             sleep_threshold=60,
-            connection_retries=5,
-            retry_delay=1,
-            timeout=30,
-            ping_interval=30,
-            max_concurrent_transmissions=5,
         )
 
     async def start(self):
@@ -241,10 +233,8 @@ async def main():
 
     logger.info("✅ Configuration verified")
 
-    # Apply optimizations
     _apply_chunk_size_patch()
 
-    # Initialize bot
     bot = Bot()
     monitor_task = None
     user_monitor_task = None
