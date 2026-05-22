@@ -48,12 +48,6 @@ def _apply_chunk_size_patch():
             *args,
             **kwargs,
         ):
-            """
-            Wrapper that:
-            - Uses 1MB chunks (reduces RPC calls)
-            - Throttles requests (prevents flood waits)
-            - Adds connection retry logic
-            """
             first_chunk = True
             retry_count = 0
             max_retries = 3
@@ -74,12 +68,12 @@ def _apply_chunk_size_patch():
                             await asyncio.sleep(_INTER_CHUNK_DELAY)
                         first_chunk = False
                         yield chunk
-                    break  # Success, exit retry loop
+                    break
 
                 except (ConnectionError, OSError, TimeoutError) as e:
                     retry_count += 1
                     if retry_count < max_retries:
-                        wait_time = (2 ** retry_count)  # Exponential backoff
+                        wait_time = (2 ** retry_count)
                         logger.warning(
                             f"Connection error (retry {retry_count}/{max_retries}), "
                             f"waiting {wait_time}s: {e}"
@@ -113,10 +107,9 @@ if STRING_SESSION is not None and LOGIN_SYSTEM is False:
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=STRING_SESSION,
-        # Stability improvements
         connection_retries=5,
         retry_delay=1,
-        timeout=30,  # Increased timeout for slow connections
+        timeout=30,
     )
 else:
     TechVJUser = None
@@ -132,19 +125,16 @@ class Bot(Client):
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
             plugins=dict(root="TechVJ"),
-            # CRITICAL FIXES:
-            workers=25,  # Reduced from 150 - prevents connection overload
-            sleep_threshold=60,  # Increased from 5 - better flood wait handling
-            # Additional stability parameters
-            connection_retries=5,  # Retry failed connections
-            retry_delay=1,  # Wait between retries
-            timeout=30,  # Request timeout in seconds
-            ping_interval=30,  # Keep-alive ping interval
-            max_concurrent_transmissions=5,  # Limit simultaneous uploads/downloads
+            workers=25,
+            sleep_threshold=60,
+            connection_retries=5,
+            retry_delay=1,
+            timeout=30,
+            ping_interval=30,
+            max_concurrent_transmissions=5,
         )
 
     async def start(self):
-        """Start bot with error handling"""
         try:
             await super().start()
             logger.info("✅ Bot Started Successfully")
@@ -154,7 +144,6 @@ class Bot(Client):
             raise
 
     async def stop(self, *args):
-        """Gracefully stop bot"""
         try:
             await super().stop()
             logger.info("✅ Bot Stopped Gracefully")
@@ -168,7 +157,6 @@ class Bot(Client):
 
 
 async def health_check_handler(request):
-    """Health check endpoint"""
     return web.Response(
         text="Bot is alive and running ✅",
         status=200,
@@ -177,7 +165,6 @@ async def health_check_handler(request):
 
 
 async def run_web_server():
-    """Run web server with error handling"""
     try:
         app = web.Application()
         app.router.add_get("/", health_check_handler)
@@ -213,12 +200,10 @@ async def run_web_server():
 
 
 async def monitor_connection(client, interval=60):
-    """Monitor client connection and log status"""
     while True:
         try:
             await asyncio.sleep(interval)
             try:
-                # Test connection
                 await client.get_me()
                 logger.debug("✅ Connection healthy")
             except Exception as e:
@@ -235,12 +220,10 @@ async def monitor_connection(client, interval=60):
 
 
 async def main():
-    """Main entry point with comprehensive error handling"""
     logger.info("=" * 70)
     logger.info("🚀 STARTING BOT APPLICATION")
     logger.info("=" * 70)
 
-    # Verify configuration
     config_ok = True
     if not API_ID:
         logger.error("❌ API_ID not set in config")
@@ -260,7 +243,6 @@ async def main():
 
     # Apply optimizations
     _apply_chunk_size_patch()
-    logger.info()
 
     # Initialize bot
     bot = Bot()
@@ -268,17 +250,13 @@ async def main():
     user_monitor_task = None
 
     try:
-        # Start bot
         logger.info("📡 Connecting Bot Client...")
         await bot.start()
         logger.info("✅ Bot Client Connected")
 
-        # Start connection monitor
         monitor_task = asyncio.create_task(monitor_connection(bot, interval=60))
         logger.info("📊 Connection Monitor Started")
-        logger.info()
 
-        # Start user client if available
         if TechVJUser is not None:
             logger.info("👤 Connecting User Client...")
             try:
@@ -291,23 +269,17 @@ async def main():
             except Exception as e:
                 logger.error(f"❌ Failed to connect User Client: {e}")
                 logger.info("   Bot will continue without user client")
-                TechVJUser = None
         else:
             logger.warning("⚠️ No User Client (STRING_SESSION not set)")
 
-        logger.info()
-
-        # Start web server
         logger.info("🔧 Initializing Web Server...")
         asyncio.create_task(run_web_server())
-        logger.info()
 
         logger.info("=" * 70)
         logger.info("✅ ALL SYSTEMS OPERATIONAL")
         logger.info("=" * 70)
-        logger.info("🤖 Bot is ready to receive messages...\n")
+        logger.info("🤖 Bot is ready to receive messages...")
 
-        # Keep running
         await idle()
 
     except KeyboardInterrupt:
@@ -321,7 +293,6 @@ async def main():
     finally:
         logger.info("🛑 Shutting down all systems...")
 
-        # Cancel monitors
         if monitor_task:
             monitor_task.cancel()
             try:
@@ -336,7 +307,6 @@ async def main():
             except asyncio.CancelledError:
                 pass
 
-        # Stop clients
         try:
             await bot.stop()
             logger.info("✅ Bot Client Stopped")
