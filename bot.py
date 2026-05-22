@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 _MAX_CHUNK_SIZE = 1024 * 1024  # 1 MB
-_INTER_CHUNK_DELAY = 0.5
+_INTER_CHUNK_DELAY = 5
 
 
 def _apply_chunk_size_patch():
